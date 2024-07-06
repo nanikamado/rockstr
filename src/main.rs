@@ -3,25 +3,30 @@ mod error;
 mod nostr;
 mod relay;
 
+use crate::nostr::Filter;
 use axum::extract::ws::{self, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
-use axum::response::Response;
+use axum::http::header::UPGRADE;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use display_as_json::AsJson;
 use error::Error;
 use log::{debug, info};
-use nostr::ClientToRelay;
+use nostr::{ClientToRelay, Event};
 use relay::{Db, QueryIter};
+use smallvec::SmallVec;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
-const BIND_ADDRESS: &str = "127.0.0.1:8001";
+const BIND_ADDRESS: &str = "127.0.0.1:8017";
 
 #[derive(Debug)]
 pub struct AppState {
     db: Db,
+    broadcast_sender: tokio::sync::broadcast::Sender<Arc<Event>>,
 }
 
 pub async fn listen(state: Arc<AppState>) -> Result<(), Error> {
@@ -38,87 +43,139 @@ pub async fn listen(state: Arc<AppState>) -> Result<(), Error> {
 pub async fn root(
     State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
 ) -> Result<Response, Error> {
     info!("root");
-    Ok(ws.on_upgrade(|mut ws| async {
-        let _ = ws_handler(state, &mut ws).await;
-        debug!("close");
-        let _ = ws.close();
-    }))
+    if headers.contains_key(UPGRADE) {
+        Ok(ws
+            .on_failed_upgrade(|a| {
+                info!("on_failed_upgrade: {a}");
+            })
+            .on_upgrade(|ws| async {
+                let receiver = state.broadcast_sender.subscribe();
+                let mut cs = ConnectionState {
+                    ws,
+                    broadcast_receiver: receiver,
+                    req: tokio::sync::Mutex::new(Vec::new()),
+                };
+                let _ = ws_handler(state, &mut cs).await;
+                debug!("close");
+                let _ = cs.ws.close().await;
+            }))
+    } else {
+        Ok("rockstr relay".into_response())
+    }
 }
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(60 * 3);
 
-async fn ws_handler(state: Arc<AppState>, ws: &mut WebSocket) -> Result<(), Error> {
+#[derive(Debug)]
+enum CloseReason {
+    WsClosed,
+    NoResponse,
+}
+
+struct ConnectionState {
+    ws: WebSocket,
+    broadcast_receiver: tokio::sync::broadcast::Receiver<Arc<Event>>,
+    req: tokio::sync::Mutex<Vec<(String, SmallVec<[Filter; 2]>)>>,
+}
+
+async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<CloseReason, Error> {
     let mut waiting_for_pong = false;
-    loop {
-        let m = tokio::time::timeout(TIMEOUT_DURATION, ws.recv()).await;
-        match m {
-            Ok(Some(Ok(m))) => {
-                waiting_for_pong = false;
-                if !handle_message(&state, ws, m).await? {
-                    break;
+    let r = loop {
+        tokio::select! {
+            m = tokio::time::timeout(TIMEOUT_DURATION, cs.ws.recv()) => {
+                match m {
+                    Ok(Some(Ok(m))) => {
+                        waiting_for_pong = false;
+                        if let Some(r) = handle_message(&state, cs, m).await? {
+                            break r;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("timeout: {e}");
+                        if waiting_for_pong {
+                            break CloseReason::NoResponse;
+                        } else {
+                            let _ = cs.ws.send(ws::Message::Ping(Vec::new())).await;
+                            waiting_for_pong = true;
+                        }
+                    }
+                    _ => break CloseReason::WsClosed,
                 }
             }
-            Err(e) => {
-                debug!("timeout: {e}");
-                if waiting_for_pong {
-                    break;
-                } else {
-                    let _ = ws.send(ws::Message::Ping(Vec::new())).await;
-                    waiting_for_pong = true;
-                }
-            }
-            _ => break,
+            Ok(e) = cs.broadcast_receiver.recv() => {
+                receive_broadcast(cs, &e).await
+            },
+        }
+    };
+    Ok(r)
+}
+
+async fn receive_broadcast(cs: &mut ConnectionState, e: &Event) {
+    for (id, filters) in cs.req.lock().await.iter() {
+        if filters.iter().any(|f| f.matches(e)) {
+            let _ = cs.ws.send(ws::Message::Text(event_message(id, e))).await;
         }
     }
-    Ok(())
+}
+
+fn event_message(id: &str, e: &Event) -> String {
+    format!(r#"["EVENT",{},{}]"#, AsJson(&id), AsJson(e))
 }
 
 async fn handle_message(
     state: &Arc<AppState>,
-    ws: &mut WebSocket,
+    cs: &mut ConnectionState,
     m: ws::Message,
-) -> Result<bool, Error> {
+) -> Result<Option<CloseReason>, Error> {
     use axum::extract::ws::Message;
-    let c = match m {
+    let continue_ = match m {
         Message::Text(m) => {
             let Ok(m): Result<ClientToRelay, _> = serde_json::from_str(&m) else {
-                return Ok(true);
+                return Ok(None);
             };
             match m {
                 ClientToRelay::Event(e) => {
                     let id = e.id;
-                    state.db.add_event(e);
-                    ws.send(Message::Text(format!(r#"["OK",{},true,""]"#, AsJson(&id))))
-                        .await?;
-                    true
+                    if e.verify() {
+                        let _ = state.broadcast_sender.send(e.clone());
+                        state.db.add_event(e);
+                        cs.ws
+                            .send(Message::Text(format!(r#"["OK",{},true,""]"#, AsJson(&id))))
+                            .await?;
+                    }
+                    None
                 }
                 ClientToRelay::Req { id, filters } => {
-                    for (_, n) in QueryIter::new(&state.db, filters) {
+                    let mut req = cs.req.lock().await;
+                    for (_, n) in QueryIter::new(&state.db, filters.clone()) {
                         let m = {
                             let n_to_event = state.db.n_to_event.read();
                             let e = n_to_event.get(&n).unwrap();
-                            Message::Text(format!(r#"["EVENT",{},{}]"#, AsJson(&id), AsJson(&e)))
+                            Message::Text(event_message(&id, e))
                         };
-                        ws.send(m).await?;
+                        cs.ws.send(m).await?;
                     }
-                    ws.send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
+                    cs.ws
+                        .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
                         .await?;
-                    true
+                    req.push((id, filters));
+                    None
                 }
-                ClientToRelay::Close(_) => false,
+                ClientToRelay::Close(_) => None,
             }
         }
-        Message::Binary(_) => true,
+        Message::Binary(_) => None,
         Message::Ping(a) => {
-            ws.send(Message::Pong(a)).await?;
-            true
+            cs.ws.send(Message::Pong(a)).await?;
+            None
         }
-        Message::Pong(_) => true,
-        Message::Close(_) => false,
+        Message::Pong(_) => None,
+        Message::Close(_) => Some(CloseReason::WsClosed),
     };
-    Ok(c)
+    Ok(continue_)
 }
 
 async fn handler_404(uri: axum::http::Uri) -> Error {
@@ -129,7 +186,10 @@ async fn handler_404(uri: axum::http::Uri) -> Error {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
-
-    let state = Arc::new(AppState { db: Db::default() });
+    let broadcast_sender = tokio::sync::broadcast::Sender::new(1000);
+    let state = Arc::new(AppState {
+        db: Db::default(),
+        broadcast_sender,
+    });
     listen(state).await
 }

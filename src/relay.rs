@@ -1,10 +1,10 @@
-use crate::nostr::{Condition, Event, EventId, Filter};
-use core::slice;
+use crate::nostr::{Condition, Event, EventId, Filter, SingleLetterTags};
 use parking_lot::RwLock;
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::Arc;
 
 pub struct QueryIter<'a>(QueryIterInner<'a>);
 
@@ -36,12 +36,12 @@ impl<'a> QueryIter<'a> {
                 });
             }
             if let Some(mut s) = GetEvents::new(f) {
-                if let Some(a) = s.next(&db) {
+                if let Some(a) = s.next(db) {
                     m.insert(a, s);
                 }
             }
         }
-        QueryIter(QueryIterInner::Filter { m: m, db })
+        QueryIter(QueryIterInner::Filter { m, db })
     }
 }
 
@@ -71,7 +71,7 @@ impl Iterator for QueryIter<'_> {
             }
             QueryIterInner::Filter { m, db } => {
                 if let Some(((t, n), mut s)) = m.pop_last() {
-                    if let Some(a) = s.next(&db) {
+                    if let Some(a) = s.next(db) {
                         m.insert(a, s);
                     }
                     Some((t, n))
@@ -88,16 +88,13 @@ type Time = u64;
 #[derive(Debug, Default)]
 pub struct Db {
     pub id_to_n: RwLock<HashMap<EventId, u64>>,
-    pub n_to_event: RwLock<HashMap<u64, Event>>,
+    pub n_to_event: RwLock<HashMap<u64, Arc<Event>>>,
     pub conditions: RwLock<BTreeSet<(Condition, Time, u64)>>,
     pub time: RwLock<BTreeSet<(Time, u64)>>,
 }
 
 impl Db {
-    pub fn add_event(&self, event: Event) -> Option<u64> {
-        if !event.verify() {
-            return None;
-        }
+    pub fn add_event(&self, event: Arc<Event>) -> Option<u64> {
         use std::collections::hash_map::Entry::*;
         let n = self.id_to_n.read().len() as u64 + 1;
         let n = match self.id_to_n.write().entry(event.id) {
@@ -109,7 +106,7 @@ impl Db {
         };
         {
             let cs = &mut self.conditions.write();
-            for (tag, value) in SingleLetterTags(event.tags.iter()) {
+            for (tag, value) in SingleLetterTags::new(&event.tags) {
                 cs.insert((Condition::Tag(tag, value), event.created_at, n));
             }
             cs.insert((Condition::Author(event.pubkey), event.created_at, n));
@@ -118,7 +115,7 @@ impl Db {
         self.time.write().insert((event.created_at, n));
         if event.kind == 5 {
             for t in &event.tags {
-                if let (Some(t), Some(v)) = (t.get(0), t.get(1)) {
+                if let (Some(t), Some(v)) = (t.first(), t.get(1)) {
                     if let ("e", Ok(e)) = (t.as_ref(), EventId::from_str(v.as_ref())) {
                         if let Some(n) = self.id_to_n.write().get(&e) {
                             self.remove_event(*n);
@@ -136,7 +133,7 @@ impl Db {
             self.id_to_n.write().remove(&event.id);
             {
                 let cs = &mut self.conditions.write();
-                for (tag, value) in SingleLetterTags(event.tags.iter()) {
+                for (tag, value) in SingleLetterTags::new(&event.tags) {
                     cs.remove(&(Condition::Tag(tag, value), event.created_at, n));
                 }
                 cs.remove(&(Condition::Author(event.pubkey), event.created_at, n));
@@ -147,24 +144,6 @@ impl Db {
         } else {
             false
         }
-    }
-}
-
-struct SingleLetterTags<'a>(slice::Iter<'a, SmallVec<[String; 3]>>);
-
-impl Iterator for SingleLetterTags<'_> {
-    type Item = (char, String);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while let Some(t) = self.0.next() {
-            if let Some(tag) = t.get(0) {
-                let mut cs = tag.chars();
-                if let (Some(tag), None) = (cs.next(), cs.next()) {
-                    return Some((tag, t.get(1).map(|a| a.to_string()).unwrap_or_default()));
-                }
-            }
-        }
-        None
     }
 }
 
@@ -224,7 +203,10 @@ impl GetEvents {
             if cs.is_empty() {
                 return None;
             }
-            conditions.insert((u64::MAX, u64::MAX - 1), ConditionsWithLatest::new(cs));
+            conditions.insert(
+                (u64::MAX, u64::MAX - 1),
+                ConditionsWithLatest::new(cs.into_iter().collect()),
+            );
         }
         Some(GetEvents {
             since: filter.since,

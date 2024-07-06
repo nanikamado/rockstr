@@ -5,9 +5,12 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::{Debug, Display, LowerHex};
 use std::io::Write;
+use std::slice;
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize)]
 pub struct EventId(sha256::Hash);
@@ -73,7 +76,7 @@ impl Event {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Filter {
     #[serde(default)]
     pub since: u64,
@@ -82,7 +85,51 @@ pub struct Filter {
     #[serde(default = "limit_default")]
     pub limit: u32,
     #[serde(flatten, deserialize_with = "deserialize_tags")]
-    pub conditions: Vec<Vec<Condition>>,
+    pub conditions: Vec<BTreeSet<Condition>>,
+}
+
+impl Filter {
+    pub fn matches(&self, e: &Event) -> bool {
+        if !(self.since <= e.created_at && e.created_at <= self.until) {
+            return false;
+        }
+        let tags: BTreeSet<_> = SingleLetterTags::new(&e.tags)
+            .map(|(c, v)| Condition::Tag(c, v))
+            .collect();
+        for c in &self.conditions {
+            if !c.contains(&Condition::Author(e.pubkey))
+                && !c.contains(&Condition::Kind(e.kind))
+                && c.is_disjoint(&tags)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+pub struct SingleLetterTags<'a>(slice::Iter<'a, SmallVec<[String; 3]>>);
+
+impl<'a> SingleLetterTags<'a> {
+    pub fn new(tags: &'a [SmallVec<[String; 3]>]) -> Self {
+        SingleLetterTags(tags.iter())
+    }
+}
+
+impl Iterator for SingleLetterTags<'_> {
+    type Item = (char, String);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for t in self.0.by_ref() {
+            if let Some(tag) = t.first() {
+                let mut cs = tag.chars();
+                if let (Some(tag), None) = (cs.next(), cs.next()) {
+                    return Some((tag, t.get(1).map(|a| a.to_string()).unwrap_or_default()));
+                }
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -100,14 +147,14 @@ fn until_default() -> u64 {
     u64::MAX
 }
 
-fn deserialize_tags<'de, D>(deserializer: D) -> Result<Vec<Vec<Condition>>, D::Error>
+fn deserialize_tags<'de, D>(deserializer: D) -> Result<Vec<BTreeSet<Condition>>, D::Error>
 where
     D: Deserializer<'de>,
 {
     struct TagsVisitor;
 
     impl<'de> Visitor<'de> for TagsVisitor {
-        type Value = Vec<Vec<Condition>>;
+        type Value = Vec<BTreeSet<Condition>>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             formatter.write_str("a map")
@@ -168,9 +215,9 @@ pub enum ClientToRelayTag {
 
 #[derive(Debug)]
 pub enum ClientToRelay<'a> {
-    Event(Event),
+    Event(Arc<Event>),
     Req {
-        id: Cow<'a, str>,
+        id: String,
         filters: SmallVec<[Filter; 2]>,
     },
     #[allow(unused)]
