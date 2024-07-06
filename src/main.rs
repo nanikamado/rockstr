@@ -150,7 +150,7 @@ async fn handle_message(
                 }
                 ClientToRelay::Req { id, filters } => {
                     let mut req = cs.req.lock().await;
-                    for (_, n) in QueryIter::new(&state.db, filters.clone()) {
+                    for (_, n) in QueryIter::new(&state.db, &filters) {
                         let m = {
                             let n_to_event = state.db.n_to_event.read();
                             let e = n_to_event.get(&n).unwrap();

@@ -6,9 +6,9 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 
-pub struct QueryIter<'a>(QueryIterInner<'a>);
+pub struct QueryIter<'a, 'b>(QueryIterInner<'a, 'b>);
 
-enum QueryIterInner<'a> {
+enum QueryIterInner<'a, 'b> {
     All {
         n: u64,
         db: &'a Db,
@@ -17,13 +17,13 @@ enum QueryIterInner<'a> {
         limit: u32,
     },
     Filter {
-        m: BTreeMap<(u64, u64), GetEvents>,
+        m: BTreeMap<(u64, u64), GetEvents<'b>>,
         db: &'a Db,
     },
 }
 
-impl<'a> QueryIter<'a> {
-    pub fn new(db: &'a Db, filters: SmallVec<[Filter; 2]>) -> Self {
+impl<'a, 'b> QueryIter<'a, 'b> {
+    pub fn new(db: &'a Db, filters: &'b SmallVec<[Filter; 2]>) -> Self {
         let mut m = BTreeMap::new();
         for f in filters {
             if f.conditions.is_empty() {
@@ -45,7 +45,7 @@ impl<'a> QueryIter<'a> {
     }
 }
 
-impl Iterator for QueryIter<'_> {
+impl Iterator for QueryIter<'_, '_> {
     type Item = (Time, u64);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -148,13 +148,13 @@ impl Db {
 }
 
 #[derive(Debug)]
-struct ConditionsWithLatest {
-    cs: BTreeMap<(Time, u64), Condition>,
-    remained: Vec<Condition>,
+struct ConditionsWithLatest<'a> {
+    cs: BTreeMap<(Time, u64), &'a Condition>,
+    remained: Vec<&'a Condition>,
 }
 
-impl ConditionsWithLatest {
-    fn new(conditions: Vec<Condition>) -> Self {
+impl<'a> ConditionsWithLatest<'a> {
+    fn new(conditions: Vec<&'a Condition>) -> Self {
         ConditionsWithLatest {
             cs: BTreeMap::new(),
             remained: conditions,
@@ -165,10 +165,10 @@ impl ConditionsWithLatest {
         let conditions = db.conditions.read();
         for c in &self.remained {
             if let Some((_, t, n)) = conditions
-                .range((c.clone(), since, 0)..=(c.clone(), until, n))
+                .range(((*c).clone(), since, 0)..=((*c).clone(), until, n))
                 .next_back()
             {
-                self.cs.insert((*t, *n), c.clone());
+                self.cs.insert((*t, *n), *c);
             }
         }
         while let Some(((t, cn), c)) = self.cs.pop_last() {
@@ -188,24 +188,24 @@ impl ConditionsWithLatest {
 }
 
 #[derive(Debug)]
-struct GetEvents {
+struct GetEvents<'a> {
     since: Time,
     until: Time,
     n: u64,
     limit: u32,
-    conditions: BTreeMap<(u64, u64), ConditionsWithLatest>,
+    conditions: BTreeMap<(u64, u64), ConditionsWithLatest<'a>>,
 }
 
-impl GetEvents {
-    fn new(filter: Filter) -> Option<Self> {
+impl<'a> GetEvents<'a> {
+    fn new(filter: &'a Filter) -> Option<Self> {
         let mut conditions = BTreeMap::new();
-        for cs in filter.conditions {
+        for cs in &filter.conditions {
             if cs.is_empty() {
                 return None;
             }
             conditions.insert(
                 (u64::MAX, u64::MAX - 1),
-                ConditionsWithLatest::new(cs.into_iter().collect()),
+                ConditionsWithLatest::new(cs.iter().collect()),
             );
         }
         Some(GetEvents {
