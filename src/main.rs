@@ -56,7 +56,7 @@ pub async fn root(
                 let mut cs = ConnectionState {
                     ws,
                     broadcast_receiver: receiver,
-                    req: tokio::sync::Mutex::new(Vec::new()),
+                    req: Vec::new(),
                 };
                 let _ = ws_handler(state, &mut cs).await;
                 debug!("close");
@@ -78,7 +78,7 @@ enum CloseReason {
 struct ConnectionState {
     ws: WebSocket,
     broadcast_receiver: tokio::sync::broadcast::Receiver<Arc<Event>>,
-    req: tokio::sync::Mutex<Vec<(String, SmallVec<[Filter; 2]>)>>,
+    req: Vec<(String, SmallVec<[Filter; 2]>)>,
 }
 
 async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<CloseReason, Error> {
@@ -114,7 +114,7 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
 }
 
 async fn receive_broadcast(cs: &mut ConnectionState, e: &Event) {
-    for (id, filters) in cs.req.lock().await.iter() {
+    for (id, filters) in &cs.req {
         if filters.iter().any(|f| f.matches(e)) {
             let _ = cs.ws.send(ws::Message::Text(event_message(id, e))).await;
         }
@@ -140,17 +140,28 @@ async fn handle_message(
                 ClientToRelay::Event(e) => {
                     let id = e.id;
                     if e.verify() {
-                        let _ = state.broadcast_sender.send(e.clone());
-                        state.db.add_event(e);
+                        let (dup, _) = state.db.add_event(e.clone());
+                        if !dup {
+                            let _ = state.broadcast_sender.send(e);
+                        }
                         cs.ws
-                            .send(Message::Text(format!(r#"["OK",{},true,""]"#, AsJson(&id))))
+                            .send(Message::Text(format!(
+                                r#"["OK",{},true,"{}"]"#,
+                                AsJson(&id),
+                                if dup {
+                                    "duplicate: already have this event"
+                                } else {
+                                    ""
+                                }
+                            )))
                             .await?;
                     }
                     None
                 }
                 ClientToRelay::Req { id, filters } => {
-                    let mut req = cs.req.lock().await;
+                    info!("lock {id}");
                     for (_, n) in QueryIter::new(&state.db, &filters) {
+                        dbg!();
                         let m = {
                             let n_to_event = state.db.n_to_event.read();
                             let e = n_to_event.get(&n).unwrap();
@@ -158,10 +169,12 @@ async fn handle_message(
                         };
                         cs.ws.send(m).await?;
                     }
+                    dbg!();
                     cs.ws
                         .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
                         .await?;
-                    req.push((id, filters));
+                    info!("unlock {id}");
+                    cs.req.push((id, filters));
                     None
                 }
                 ClientToRelay::Close(_) => None,
@@ -191,5 +204,24 @@ async fn main() -> Result<(), Error> {
         db: Db::default(),
         broadcast_sender,
     });
-    listen(state).await
+    tokio::try_join!(listen(state), dead_lock_detection())?;
+    Ok(())
+}
+
+async fn dead_lock_detection() -> Result<(), Error> {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 2)).await;
+        for deadlock in parking_lot::deadlock::check_deadlock() {
+            if let Some(d) = deadlock.first() {
+                return Err(error::Error::Internal(
+                    anyhow::anyhow!(format!(
+                        "found deadlock {}:\n{:?}",
+                        d.thread_id(),
+                        d.backtrace()
+                    ))
+                    .into(),
+                ));
+            }
+        }
+    }
 }

@@ -1,6 +1,8 @@
 use crate::nostr::{Condition, Event, EventId, Filter, SingleLetterTags};
+use log::trace;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::str::FromStr;
@@ -49,6 +51,7 @@ impl Iterator for QueryIter<'_, '_> {
     type Item = (Time, u64);
 
     fn next(&mut self) -> Option<Self::Item> {
+        trace!("QueryIter::next");
         match &mut self.0 {
             QueryIterInner::All {
                 n,
@@ -57,6 +60,7 @@ impl Iterator for QueryIter<'_, '_> {
                 until,
                 limit,
             } => {
+                dbg!();
                 if *limit == 0 {
                     None
                 } else if let Some(a) = db.time.read().range((*since, 0)..=(*until, *n)).next_back()
@@ -70,12 +74,15 @@ impl Iterator for QueryIter<'_, '_> {
                 }
             }
             QueryIterInner::Filter { m, db } => {
+                dbg!();
                 if let Some(((t, n), mut s)) = m.pop_last() {
                     if let Some(a) = s.next(db) {
                         m.insert(a, s);
                     }
+                    dbg!();
                     Some((t, n))
                 } else {
+                    dbg!();
                     None
                 }
             }
@@ -89,16 +96,16 @@ type Time = u64;
 pub struct Db {
     pub id_to_n: RwLock<HashMap<EventId, u64>>,
     pub n_to_event: RwLock<HashMap<u64, Arc<Event>>>,
-    pub conditions: RwLock<BTreeSet<(Condition, Time, u64)>>,
+    pub conditions: RwLock<BTreeSet<(Cow<'static, Condition>, Time, u64)>>,
     pub time: RwLock<BTreeSet<(Time, u64)>>,
 }
 
 impl Db {
-    pub fn add_event(&self, event: Arc<Event>) -> Option<u64> {
+    pub fn add_event(&self, event: Arc<Event>) -> (bool, u64) {
         use std::collections::hash_map::Entry::*;
         let n = self.id_to_n.read().len() as u64 + 1;
         let n = match self.id_to_n.write().entry(event.id) {
-            Occupied(e) => return Some(*e.get()),
+            Occupied(e) => return (true, *e.get()),
             Vacant(e) => {
                 e.insert(n);
                 n
@@ -107,10 +114,14 @@ impl Db {
         {
             let cs = &mut self.conditions.write();
             for (tag, value) in SingleLetterTags::new(&event.tags) {
-                cs.insert((Condition::Tag(tag, value), event.created_at, n));
+                cs.insert((Cow::Owned(Condition::Tag(tag, value)), event.created_at, n));
             }
-            cs.insert((Condition::Author(event.pubkey), event.created_at, n));
-            cs.insert((Condition::Kind(event.kind), event.created_at, n));
+            cs.insert((
+                Cow::Owned(Condition::Author(event.pubkey)),
+                event.created_at,
+                n,
+            ));
+            cs.insert((Cow::Owned(Condition::Kind(event.kind)), event.created_at, n));
         }
         self.time.write().insert((event.created_at, n));
         if event.kind == 5 {
@@ -125,7 +136,7 @@ impl Db {
             }
         }
         self.n_to_event.write().insert(n, event);
-        Some(n)
+        (false, n)
     }
 
     pub fn remove_event(&self, n: u64) -> bool {
@@ -134,10 +145,14 @@ impl Db {
             {
                 let cs = &mut self.conditions.write();
                 for (tag, value) in SingleLetterTags::new(&event.tags) {
-                    cs.remove(&(Condition::Tag(tag, value), event.created_at, n));
+                    cs.remove(&(Cow::Owned(Condition::Tag(tag, value)), event.created_at, n));
                 }
-                cs.remove(&(Condition::Author(event.pubkey), event.created_at, n));
-                cs.remove(&(Condition::Kind(event.kind), event.created_at, n));
+                cs.remove(&(
+                    Cow::Owned(Condition::Author(event.pubkey)),
+                    event.created_at,
+                    n,
+                ));
+                cs.remove(&(Cow::Owned(Condition::Kind(event.kind)), event.created_at, n));
             }
             self.time.write().remove(&(event.created_at, n));
             true
@@ -162,25 +177,27 @@ impl<'a> ConditionsWithLatest<'a> {
     }
 
     fn next(&mut self, db: &Db, since: Time, until: Time, n: u64) -> Option<(Time, u64)> {
+        trace!("ConditionsWithLatest::next");
         let conditions = db.conditions.read();
         for c in &self.remained {
             if let Some((_, t, n)) = conditions
-                .range(((*c).clone(), since, 0)..=((*c).clone(), until, n))
+                .range((Cow::Borrowed(*c), since, 0)..=(Cow::Borrowed(*c), until, n))
                 .next_back()
             {
                 self.cs.insert((*t, *n), *c);
             }
         }
         while let Some(((t, cn), c)) = self.cs.pop_last() {
-            if t <= until && cn <= n {
+            if (t, cn) <= (until, n) {
+                trace!("return");
                 self.remained.push(c);
                 return Some((t, cn));
             }
             if let Some((_, t, n)) = conditions
-                .range((c.clone(), since, 0)..=(c.clone(), until, n))
+                .range((Cow::Borrowed(c), since, 0)..=(Cow::Borrowed(c), until, n))
                 .next_back()
             {
-                self.cs.insert((*t, *n), c);
+                self.cs.insert(dbg!((*t, *n)), c);
             }
         }
         None
@@ -218,15 +235,18 @@ impl<'a> GetEvents<'a> {
     }
 
     fn next(&mut self, db: &Db) -> Option<(Time, u64)> {
+        trace!("GetEvents::next");
         if self.limit == 0 || self.n == 0 || self.conditions.is_empty() {
             return None;
         }
         self.limit -= 1;
         loop {
+            trace!("loop 1");
             let mut next_conditions = BTreeMap::new();
             let mut first = true;
             let mut all = true;
             while let Some(((p_diff, _), mut cs)) = self.conditions.pop_last() {
+                trace!("loop 2 {{");
                 if let Some((t, n)) = cs.next(db, self.since, self.until, self.n) {
                     let diff = (self.until - t, self.n - n);
                     self.until = t;
@@ -240,7 +260,9 @@ impl<'a> GetEvents<'a> {
                     if c_len != 0 {
                         next_conditions.insert((diff.0 / (c_len * 2) + p_diff / 2, diff.1), cs);
                     }
+                    trace!("loop 2 }}");
                 } else {
+                    trace!("loop 2 }}");
                     return None;
                 }
             }
