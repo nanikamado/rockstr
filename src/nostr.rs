@@ -99,7 +99,7 @@ impl Filter {
         for c in &self.conditions {
             if !c.contains(&Condition::Author(e.pubkey))
                 && !c.contains(&Condition::Kind(e.kind))
-                // && !c.contains(&Condition::Id(e.id))
+                && !c.contains(&Condition::Id(e.id))
                 && c.is_disjoint(&tags)
             {
                 return false;
@@ -138,6 +138,7 @@ pub enum Condition {
     Tag(char, String),
     Author(PubKey),
     Kind(u32),
+    Id(EventId),
 }
 
 fn limit_default() -> u32 {
@@ -180,12 +181,12 @@ where
                             .map(Condition::Kind)
                             .collect(),
                     ),
-                    // "id" => tags.push(
-                    //     map.next_value::<Vec<EventId>>()?
-                    //         .into_iter()
-                    //         .map(Condition::Id)
-                    //         .collect(),
-                    // ),
+                    "ids" => tags.push(
+                        map.next_value::<Vec<EventId>>()?
+                            .into_iter()
+                            .map(Condition::Id)
+                            .collect(),
+                    ),
                     _ => {
                         let mut chars = key.chars();
                         if let (Some('#'), Some(c), None) =

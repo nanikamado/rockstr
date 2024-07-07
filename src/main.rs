@@ -1,6 +1,7 @@
 mod display_as_json;
 mod error;
 mod nostr;
+mod priority_queue;
 mod relay;
 
 use crate::nostr::Filter;
@@ -15,7 +16,7 @@ use display_as_json::AsJson;
 use error::Error;
 use log::{debug, info};
 use nostr::{ClientToRelay, Event};
-use relay::{Db, QueryIter};
+use relay::{Db, QueryIter, Time};
 use smallvec::SmallVec;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -105,18 +106,28 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
                     _ => break CloseReason::WsClosed,
                 }
             }
-            Ok(e) = cs.broadcast_receiver.recv() => {
-                receive_broadcast(cs, &e).await
+            e = cs.broadcast_receiver.recv() => {
+                receive_broadcast(cs, e).await
             },
         }
     };
     Ok(r)
 }
 
-async fn receive_broadcast(cs: &mut ConnectionState, e: &Event) {
-    for (id, filters) in &cs.req {
-        if filters.iter().any(|f| f.matches(e)) {
-            let _ = cs.ws.send(ws::Message::Text(event_message(id, e))).await;
+async fn receive_broadcast(
+    cs: &mut ConnectionState,
+    e: Result<Arc<Event>, tokio::sync::broadcast::error::RecvError>,
+) {
+    match e {
+        Ok(e) => {
+            for (id, filters) in &cs.req {
+                if filters.iter().any(|f| f.matches(&e)) {
+                    let _ = cs.ws.send(ws::Message::Text(event_message(id, &e))).await;
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("receive error: {e}")
         }
     }
 }
@@ -160,16 +171,17 @@ async fn handle_message(
                 }
                 ClientToRelay::Req { id, filters } => {
                     info!("lock {id}");
-                    for (_, n) in QueryIter::new(&state.db, &filters) {
-                        dbg!();
+                    for Time(_, n) in QueryIter::new(&state.db, &filters) {
                         let m = {
                             let n_to_event = state.db.n_to_event.read();
                             let e = n_to_event.get(&n).unwrap();
+                            if filters.iter().all(|f| !f.matches(e)) {
+                                log::error!("weird");
+                            }
                             Message::Text(event_message(&id, e))
                         };
                         cs.ws.send(m).await?;
                     }
-                    dbg!();
                     cs.ws
                         .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
                         .await?;
