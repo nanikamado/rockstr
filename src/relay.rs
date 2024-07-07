@@ -2,9 +2,10 @@ use crate::nostr::{Condition, Event, EventId, Filter, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
 use log::trace;
 use parking_lot::RwLock;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -95,9 +96,10 @@ type UnixTime = u64;
 
 #[derive(Debug, Default)]
 pub struct Db {
-    pub n_to_event: RwLock<HashMap<u64, Arc<Event>>>,
+    pub n_to_event: RwLock<FxHashMap<u64, Arc<Event>>>,
     pub conditions: RwLock<BTreeSet<(Cow<'static, Condition>, Time)>>,
     pub time: RwLock<BTreeSet<Time>>,
+    pub deleted: RwLock<FxHashSet<EventId>>,
 }
 
 impl Db {
@@ -144,6 +146,7 @@ impl Db {
             for t in &event.tags {
                 if let (Some(t), Some(v)) = (t.first(), t.get(1)) {
                     if let ("e", Ok(e)) = (t.as_ref(), EventId::from_str(v.as_ref())) {
+                        self.deleted.write().insert(e);
                         if let Some(n) = self.id_to_n(e) {
                             self.remove_event(n);
                         }

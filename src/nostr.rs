@@ -70,10 +70,6 @@ impl Event {
             .verify(&Message::from_digest(*self.id.0.as_ref()), &self.pubkey.0)
             .is_ok()
     }
-
-    pub fn verify(&self) -> bool {
-        self.verify_hash() && self.verify_sig()
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

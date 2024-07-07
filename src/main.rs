@@ -150,22 +150,38 @@ async fn handle_message(
             match m {
                 ClientToRelay::Event(e) => {
                     let id = e.id;
-                    if e.verify() {
-                        let (dup, _) = state.db.add_event(e.clone());
-                        if !dup {
-                            let _ = state.broadcast_sender.send(e);
-                        }
+                    if !e.verify_hash() {
                         cs.ws
                             .send(Message::Text(format!(
-                                r#"["OK",{},true,"{}"]"#,
-                                AsJson(&id),
-                                if dup {
-                                    "duplicate: already have this event"
-                                } else {
-                                    ""
-                                }
+                                r#"["OK","{id}",false,"invalid: bad event id"]"#,
                             )))
                             .await?;
+                    } else if !e.verify_sig() {
+                        cs.ws
+                            .send(Message::Text(format!(
+                                r#"["OK","{id}",false,"invalid: bad signature"]"#,
+                            )))
+                            .await?;
+                    } else if state.db.deleted.read().contains(&id) {
+                        cs.ws
+                            .send(Message::Text(format!(
+                                r#"["OK","{id}",false,"deleted: user requested deletion"]"#,
+                            )))
+                            .await?;
+                    } else {
+                        let (dup, _) = state.db.add_event(e.clone());
+                        if dup {
+                            cs.ws
+                                .send(Message::Text(format!(
+                                    r#"["OK","{id}",true,"duplicate: already have this event"]"#,
+                                )))
+                                .await?;
+                        } else {
+                            let _ = state.broadcast_sender.send(e);
+                            cs.ws
+                                .send(Message::Text(format!(r#"["OK","{id}",true,""]"#,)))
+                                .await?;
+                        }
                     }
                     None
                 }
