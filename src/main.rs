@@ -16,7 +16,8 @@ use display_as_json::AsJson;
 use error::Error;
 use log::{debug, info};
 use nostr::{ClientToRelay, Event};
-use relay::{Db, GetEvents, Time};
+use parking_lot::RwLock;
+use relay::{AddEventError, Db, GetEvents, Time};
 use smallvec::SmallVec;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ const BIND_ADDRESS: &str = "127.0.0.1:8017";
 
 #[derive(Debug)]
 pub struct AppState {
-    db: Db,
+    db: RwLock<Db>,
     broadcast_sender: tokio::sync::broadcast::Sender<Arc<Event>>,
 }
 
@@ -168,53 +169,73 @@ async fn handle_message(
                                 r#"["OK","{id}",false,"invalid: bad signature"]"#,
                             )))
                             .await?;
-                    } else if state.db.deleted.read().contains(&id) {
+                    } else if state.db.read().deleted.contains(&id) {
                         cs.ws
                             .send(Message::Text(format!(
                                 r#"["OK","{id}",false,"deleted: user requested deletion"]"#,
                             )))
                             .await?;
+                    } else if (20_000..30_000).contains(&e.kind) {
+                        let _ = state.broadcast_sender.send(e);
+                        cs.ws
+                            .send(Message::Text(format!(r#"["OK","{id}",true,""]"#,)))
+                            .await?;
                     } else {
-                        let (dup, _) = state.db.add_event(e.clone());
-                        if dup {
-                            cs.ws
+                        let r = state.db.write().add_event(e.clone());
+                        match r {
+                            Ok(_) => {
+                                let _ = state.broadcast_sender.send(e);
+                                cs.ws
+                                    .send(Message::Text(format!(r#"["OK","{id}",true,""]"#,)))
+                                    .await?;
+                                if state.db.read().n_to_event.len() >= 100_000 {
+                                    let oldest = {
+                                        state
+                                            .db
+                                            .read()
+                                            .time
+                                            .first()
+                                            .unwrap_or_else(|| {
+                                                panic!(
+                                                    "state.db.n_to_event.read() = {:?}",
+                                                    state.db.read()
+                                                )
+                                            })
+                                            .1
+                                    };
+                                    info!("remove {oldest}");
+                                    state.db.write().remove_event(oldest);
+                                }
+                            }
+                            Err(AddEventError::Duplicated) => {
+                                cs.ws
                                 .send(Message::Text(format!(
                                     r#"["OK","{id}",true,"duplicate: already have this event"]"#,
                                 )))
                                 .await?;
-                        } else {
-                            let _ = state.broadcast_sender.send(e);
-                            cs.ws
-                                .send(Message::Text(format!(r#"["OK","{id}",true,""]"#,)))
-                                .await?;
-                            if state.db.n_to_event.read().len() >= 100000 {
-                                info!("too big");
-                                let oldest = {
-                                    let t = state.db.time.read();
-                                    t.first()
-                                        .unwrap_or_else(|| {
-                                            panic!(
-                                                "state.db.n_to_event.read() = {:?}",
-                                                state.db.n_to_event.read()
-                                            )
-                                        })
-                                        .1
-                                };
-                                info!("remove {oldest}");
-                                state.db.remove_event(oldest);
+                            }
+                            Err(AddEventError::HaveNewer) => {
+                                cs.ws
+                                    .send(Message::Text(format!(
+                                        r#"["OK","{id}",true,"duplicate: have newer event"]"#,
+                                    )))
+                                    .await?;
                             }
                         }
                     }
                     None
                 }
                 ClientToRelay::Req { id, filters } => {
-                    info!("lock {id}");
                     for f in &filters {
                         if let Some(mut s) = GetEvents::new(f) {
-                            while let Some(Time(_, n)) = s.next(&state.db) {
+                            while let Some(Time(_, n)) = {
+                                let db = state.db.read();
+                                s.next(&db)
+                            } {
                                 let m = {
-                                    let n_to_event = state.db.n_to_event.read();
-                                    let e = n_to_event.get(&n).unwrap_or_else(|| panic!("n = {n}"));
+                                    let db = state.db.read();
+                                    let e =
+                                        db.n_to_event.get(&n).unwrap_or_else(|| panic!("n = {n}"));
                                     if filters.iter().all(|f| !f.matches(e)) {
                                         log::error!("weird");
                                     }
@@ -227,7 +248,6 @@ async fn handle_message(
                     cs.ws
                         .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
                         .await?;
-                    info!("unlock {id}");
                     cs.req.push((id, filters));
                     None
                 }
@@ -255,7 +275,7 @@ async fn main() -> Result<(), Error> {
     env_logger::init();
     let broadcast_sender = tokio::sync::broadcast::Sender::new(1000);
     let state = Arc::new(AppState {
-        db: Db::default(),
+        db: Default::default(),
         broadcast_sender,
     });
     tokio::try_join!(listen(state), dead_lock_detection())?;

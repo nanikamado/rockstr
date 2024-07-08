@@ -1,29 +1,27 @@
 use crate::nostr::{Condition, Event, EventId, Filter, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
-use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::str::FromStr;
-use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
 
 type UnixTime = u64;
 
 #[derive(Debug)]
 pub struct Db {
-    pub n_pool: AtomicU64,
-    pub n_to_event: RwLock<FxHashMap<u64, Arc<Event>>>,
-    pub conditions: RwLock<BTreeSet<(Cow<'static, Condition>, Time)>>,
-    pub time: RwLock<BTreeSet<Time>>,
-    pub deleted: RwLock<FxHashSet<EventId>>,
+    pub next_n: u64,
+    pub n_to_event: FxHashMap<u64, Arc<Event>>,
+    pub conditions: BTreeSet<(Cow<'static, Condition>, Time)>,
+    pub time: BTreeSet<Time>,
+    pub deleted: FxHashSet<EventId>,
 }
 
 impl Default for Db {
     fn default() -> Self {
         Self {
-            n_pool: AtomicU64::new(1),
+            next_n: 1,
             n_to_event: Default::default(),
             conditions: Default::default(),
             time: Default::default(),
@@ -32,12 +30,17 @@ impl Default for Db {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum AddEventError {
+    Duplicated,
+    HaveNewer,
+}
+
 impl Db {
     pub fn id_to_n(&self, id: EventId) -> Option<u64> {
         let id = Condition::Id(id);
         Some(
             self.conditions
-                .read()
                 .range((Cow::Borrowed(&id), Time::ZERO)..(Cow::Borrowed(&id), Time::MAX))
                 .next()?
                 .1
@@ -45,73 +48,143 @@ impl Db {
         )
     }
 
-    pub fn add_event(&self, event: Arc<Event>) -> (bool, u64) {
-        if let Some(n) = self.id_to_n(event.id) {
-            return (true, n);
+    pub fn add_event(&mut self, event: Arc<Event>) -> Result<u64, AddEventError> {
+        if let Some(_) = self.id_to_n(event.id) {
+            return Err(AddEventError::Duplicated);
         }
-        let n = self.n_pool.fetch_add(1, atomic::Ordering::Relaxed);
-        {
-            let cs = &mut self.conditions.write();
-            for (tag, value) in SingleLetterTags::new(&event.tags) {
-                cs.insert((
-                    Cow::Owned(Condition::Tag(tag, value)),
-                    Time(event.created_at, n),
-                ));
+        match event.kind {
+            0 | 3 | 10000..=19999 => {
+                let author = Condition::Author(event.pubkey);
+                let kind = Condition::Kind(event.kind);
+                let mut i = GetEvents {
+                    since: 0,
+                    until: Time(u64::MAX, u64::MAX),
+                    and_conditions: PriorityQueue::from([
+                        (u64::MAX, ConditionsWithLatest::new(vec![&author])),
+                        (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind])),
+                    ]),
+                    limit: 2,
+                };
+                if let Some(Time(t, n)) = i.next(self) {
+                    let have_newer = match t.cmp(&event.created_at) {
+                        std::cmp::Ordering::Less => false,
+                        std::cmp::Ordering::Equal => {
+                            let e = &self.n_to_event[&n];
+                            e.id > event.id
+                        }
+                        std::cmp::Ordering::Greater => true,
+                    };
+                    if have_newer {
+                        return Err(AddEventError::HaveNewer);
+                    } else {
+                        self.remove_event(n);
+                    }
+                }
             }
-            cs.insert((
-                Cow::Owned(Condition::Author(event.pubkey)),
-                Time(event.created_at, n),
-            ));
-            cs.insert((
-                Cow::Owned(Condition::Id(event.id)),
-                Time(event.created_at, n),
-            ));
-            cs.insert((
-                Cow::Owned(Condition::Kind(event.kind)),
-                Time(event.created_at, n),
-            ));
-        }
-        self.time.write().insert(Time(event.created_at, n));
-        if event.kind == 5 {
-            for t in &event.tags {
-                if let (Some(t), Some(v)) = (t.first(), t.get(1)) {
-                    if let ("e", Ok(e)) = (t.as_ref(), EventId::from_str(v.as_ref())) {
-                        self.deleted.write().insert(e);
-                        if let Some(n) = self.id_to_n(e) {
-                            self.remove_event(n);
+            30000..=39999 => {
+                fn first_d_value(event: &Event) -> Option<&str> {
+                    event.tags.iter().find_map(|t| {
+                        if t.get(0)? == "d" {
+                            Some(t.get(1).map(|a| a.as_str()).unwrap_or(""))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                if let Some(d_value) = first_d_value(&event) {
+                    let author = Condition::Author(event.pubkey);
+                    let kind = Condition::Kind(event.kind);
+                    let d_tag = Condition::Tag('d', d_value.to_string());
+                    let mut i = GetEvents {
+                        since: 0,
+                        until: Time(u64::MAX, u64::MAX),
+                        and_conditions: PriorityQueue::from([
+                            (u64::MAX, ConditionsWithLatest::new(vec![&author])),
+                            (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind])),
+                            (u64::MAX - 1, ConditionsWithLatest::new(vec![&d_tag])),
+                        ]),
+                        limit: 2,
+                    };
+                    while let Some(Time(t, n)) = i.next(self) {
+                        if first_d_value(&self.n_to_event[&n]).map_or(false, |d| d == d_value) {
+                            let have_newer = match t.cmp(&event.created_at) {
+                                std::cmp::Ordering::Less => false,
+                                std::cmp::Ordering::Equal => {
+                                    let e = &self.n_to_event[&n];
+                                    e.id > event.id
+                                }
+                                std::cmp::Ordering::Greater => true,
+                            };
+                            if have_newer {
+                                return Err(AddEventError::HaveNewer);
+                            } else {
+                                self.remove_event(n);
+                                break;
+                            }
                         }
                     }
                 }
             }
+            5 => {
+                for t in &event.tags {
+                    if let (Some(t), Some(v)) = (t.first(), t.get(1)) {
+                        if let ("e", Ok(e)) = (t.as_ref(), EventId::from_str(v.as_ref())) {
+                            self.deleted.insert(e);
+                            if let Some(n) = self.id_to_n(e) {
+                                self.remove_event(n);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => (),
         }
-        self.n_to_event.write().insert(n, event);
-        (false, n)
+        let n = self.next_n;
+        self.next_n = n + 1;
+        for (tag, value) in SingleLetterTags::new(&event.tags) {
+            self.conditions.insert((
+                Cow::Owned(Condition::Tag(tag, value)),
+                Time(event.created_at, n),
+            ));
+        }
+        self.conditions.insert((
+            Cow::Owned(Condition::Author(event.pubkey)),
+            Time(event.created_at, n),
+        ));
+        self.conditions.insert((
+            Cow::Owned(Condition::Id(event.id)),
+            Time(event.created_at, n),
+        ));
+        self.conditions.insert((
+            Cow::Owned(Condition::Kind(event.kind)),
+            Time(event.created_at, n),
+        ));
+        self.time.insert(Time(event.created_at, n));
+        self.n_to_event.insert(n, event);
+        Ok(n)
     }
 
-    pub fn remove_event(&self, n: u64) -> bool {
-        if let Some(event) = self.n_to_event.write().remove(&n) {
-            {
-                let cs = &mut self.conditions.write();
-                for (tag, value) in SingleLetterTags::new(&event.tags) {
-                    cs.remove(&(
-                        Cow::Owned(Condition::Tag(tag, value)),
-                        Time(event.created_at, n),
-                    ));
-                }
-                cs.remove(&(
-                    Cow::Owned(Condition::Author(event.pubkey)),
-                    Time(event.created_at, n),
-                ));
-                cs.remove(&(
-                    Cow::Owned(Condition::Id(event.id)),
-                    Time(event.created_at, n),
-                ));
-                cs.remove(&(
-                    Cow::Owned(Condition::Kind(event.kind)),
+    pub fn remove_event(&mut self, n: u64) -> bool {
+        if let Some(event) = self.n_to_event.remove(&n) {
+            for (tag, value) in SingleLetterTags::new(&event.tags) {
+                self.conditions.remove(&(
+                    Cow::Owned(Condition::Tag(tag, value)),
                     Time(event.created_at, n),
                 ));
             }
-            self.time.write().remove(&Time(event.created_at, n));
+            self.conditions.remove(&(
+                Cow::Owned(Condition::Author(event.pubkey)),
+                Time(event.created_at, n),
+            ));
+            self.conditions.remove(&(
+                Cow::Owned(Condition::Id(event.id)),
+                Time(event.created_at, n),
+            ));
+            self.conditions.remove(&(
+                Cow::Owned(Condition::Kind(event.kind)),
+                Time(event.created_at, n),
+            ));
+            self.time.remove(&Time(event.created_at, n));
             true
         } else {
             false
@@ -134,9 +207,9 @@ impl<'a> ConditionsWithLatest<'a> {
     }
 
     fn next(&mut self, db: &Db, since: UnixTime, until: Time) -> Option<Time> {
-        let conditions = db.conditions.read();
         while let Some(c) = self.remained.pop() {
-            if let Some((_, t)) = conditions
+            if let Some((_, t)) = db
+                .conditions
                 .range((Cow::Borrowed(c), Time(since, 0))..=(Cow::Borrowed(c), until))
                 .next_back()
             {
@@ -148,7 +221,8 @@ impl<'a> ConditionsWithLatest<'a> {
                 self.remained.push(c);
                 return Some(t);
             }
-            if let Some((_, t)) = conditions
+            if let Some((_, t)) = db
+                .conditions
                 .range((Cow::Borrowed(c), Time(since, 0))..=(Cow::Borrowed(c), until))
                 .next_back()
             {
@@ -215,12 +289,7 @@ impl<'a> GetEvents<'a> {
         }
         self.limit -= 1;
         if self.and_conditions.is_empty() {
-            return if let Some(t) = db
-                .time
-                .read()
-                .range(Time(self.since, 0)..=self.until)
-                .next_back()
-            {
+            return if let Some(t) = db.time.range(Time(self.since, 0)..=self.until).next_back() {
                 self.until = t.pred();
                 Some(*t)
             } else {
