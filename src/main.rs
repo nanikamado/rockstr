@@ -16,7 +16,7 @@ use display_as_json::AsJson;
 use error::Error;
 use log::{debug, info};
 use nostr::{ClientToRelay, Event};
-use relay::{Db, QueryIter, Time};
+use relay::{Db, GetEvents, Time};
 use smallvec::SmallVec;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -143,14 +143,20 @@ async fn handle_message(
 ) -> Result<Option<CloseReason>, Error> {
     use axum::extract::ws::Message;
     let continue_ = match m {
-        Message::Text(m) => {
-            let Ok(m): Result<ClientToRelay, _> = serde_json::from_str(&m) else {
+        Message::Text(s) => {
+            let Ok(m): Result<ClientToRelay, _> = serde_json::from_str(&s) else {
                 return Ok(None);
             };
             match m {
                 ClientToRelay::Event(e) => {
                     let id = e.id;
-                    if !e.verify_hash() {
+                    if s.len() > 100000 {
+                        cs.ws
+                            .send(Message::Text(format!(
+                                r#"["OK","{id}",false,"invalid: too large event"]"#,
+                            )))
+                            .await?;
+                    } else if !e.verify_hash() {
                         cs.ws
                             .send(Message::Text(format!(
                                 r#"["OK","{id}",false,"invalid: bad event id"]"#,
@@ -181,22 +187,42 @@ async fn handle_message(
                             cs.ws
                                 .send(Message::Text(format!(r#"["OK","{id}",true,""]"#,)))
                                 .await?;
+                            if state.db.n_to_event.read().len() >= 100000 {
+                                info!("too big");
+                                let oldest = {
+                                    let t = state.db.time.read();
+                                    t.first()
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "state.db.n_to_event.read() = {:?}",
+                                                state.db.n_to_event.read()
+                                            )
+                                        })
+                                        .1
+                                };
+                                info!("remove {oldest}");
+                                state.db.remove_event(oldest);
+                            }
                         }
                     }
                     None
                 }
                 ClientToRelay::Req { id, filters } => {
                     info!("lock {id}");
-                    for Time(_, n) in QueryIter::new(&state.db, &filters) {
-                        let m = {
-                            let n_to_event = state.db.n_to_event.read();
-                            let e = n_to_event.get(&n).unwrap();
-                            if filters.iter().all(|f| !f.matches(e)) {
-                                log::error!("weird");
+                    for f in &filters {
+                        if let Some(mut s) = GetEvents::new(f) {
+                            while let Some(Time(_, n)) = s.next(&state.db) {
+                                let m = {
+                                    let n_to_event = state.db.n_to_event.read();
+                                    let e = n_to_event.get(&n).unwrap_or_else(|| panic!("n = {n}"));
+                                    if filters.iter().all(|f| !f.matches(e)) {
+                                        log::error!("weird");
+                                    }
+                                    Message::Text(event_message(&id, e))
+                                };
+                                cs.ws.send(m).await?;
                             }
-                            Message::Text(event_message(&id, e))
-                        };
-                        cs.ws.send(m).await?;
+                        }
                     }
                     cs.ws
                         .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))

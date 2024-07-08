@@ -1,105 +1,35 @@
 use crate::nostr::{Condition, Event, EventId, Filter, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
-use log::trace;
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::str::FromStr;
+use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
-
-pub struct QueryIter<'a, 'b>(QueryIterInner<'a, 'b>);
-
-enum QueryIterInner<'a, 'b> {
-    All {
-        n: u64,
-        db: &'a Db,
-        since: UnixTime,
-        until: UnixTime,
-        limit: u32,
-    },
-    Filter {
-        or_conditions: PriorityQueue<Time, GetEvents<'b>>,
-        db: &'a Db,
-    },
-}
-
-impl<'a, 'b> QueryIter<'a, 'b> {
-    pub fn new(db: &'a Db, filters: &'b SmallVec<[Filter; 2]>) -> Self {
-        let mut or_conditions = PriorityQueue::with_capacity(filters.len());
-        for f in filters {
-            if f.conditions.is_empty() {
-                return QueryIter(QueryIterInner::All {
-                    n: u64::MAX,
-                    db,
-                    since: f.since,
-                    until: f.until,
-                    limit: f.limit,
-                });
-            }
-            if let Some(mut s) = GetEvents::new(f) {
-                if let Some(a) = s.next(db) {
-                    or_conditions.push(a, s);
-                }
-            }
-        }
-        QueryIter(QueryIterInner::Filter { or_conditions, db })
-    }
-}
-
-impl Iterator for QueryIter<'_, '_> {
-    type Item = Time;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        trace!("QueryIter::next");
-        match &mut self.0 {
-            QueryIterInner::All {
-                n,
-                db,
-                since,
-                until,
-                limit,
-            } => {
-                if *limit == 0 {
-                    None
-                } else if let Some(a) = db
-                    .time
-                    .read()
-                    .range(Time(*since, 0)..=Time(*until, *n))
-                    .next_back()
-                {
-                    *limit -= 1;
-                    *until = a.0;
-                    *n = a.1 - 1;
-                    Some(*a)
-                } else {
-                    None
-                }
-            }
-            QueryIterInner::Filter { or_conditions, db } => {
-                if let Some((t, mut s)) = or_conditions.pop() {
-                    if let Some(a) = s.next(db) {
-                        or_conditions.push(a, s);
-                    }
-                    Some(t)
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
 
 type UnixTime = u64;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Db {
+    pub n_pool: AtomicU64,
     pub n_to_event: RwLock<FxHashMap<u64, Arc<Event>>>,
     pub conditions: RwLock<BTreeSet<(Cow<'static, Condition>, Time)>>,
     pub time: RwLock<BTreeSet<Time>>,
     pub deleted: RwLock<FxHashSet<EventId>>,
+}
+
+impl Default for Db {
+    fn default() -> Self {
+        Self {
+            n_pool: AtomicU64::new(1),
+            n_to_event: Default::default(),
+            conditions: Default::default(),
+            time: Default::default(),
+            deleted: Default::default(),
+        }
+    }
 }
 
 impl Db {
@@ -116,10 +46,10 @@ impl Db {
     }
 
     pub fn add_event(&self, event: Arc<Event>) -> (bool, u64) {
-        let n = self.n_to_event.read().len() as u64 + 1;
         if let Some(n) = self.id_to_n(event.id) {
             return (true, n);
         }
+        let n = self.n_pool.fetch_add(1, atomic::Ordering::Relaxed);
         {
             let cs = &mut self.conditions.write();
             for (tag, value) in SingleLetterTags::new(&event.tags) {
@@ -255,7 +185,7 @@ impl Time {
 }
 
 #[derive(Debug)]
-struct GetEvents<'a> {
+pub struct GetEvents<'a> {
     since: UnixTime,
     until: Time,
     limit: u32,
@@ -263,7 +193,7 @@ struct GetEvents<'a> {
 }
 
 impl<'a> GetEvents<'a> {
-    fn new(filter: &'a Filter) -> Option<Self> {
+    pub fn new(filter: &'a Filter) -> Option<Self> {
         let mut and_conditions = PriorityQueue::with_capacity(filter.conditions.len());
         for cs in &filter.conditions {
             if cs.is_empty() {
@@ -279,13 +209,26 @@ impl<'a> GetEvents<'a> {
         })
     }
 
-    fn next(&mut self, db: &Db) -> Option<Time> {
-        if self.limit == 0 || self.until == Time::ZERO || self.and_conditions.is_empty() {
+    pub fn next(&mut self, db: &Db) -> Option<Time> {
+        if self.limit == 0 || self.until == Time::ZERO {
             return None;
         }
         self.limit -= 1;
+        if self.and_conditions.is_empty() {
+            return if let Some(t) = db
+                .time
+                .read()
+                .range(Time(self.since, 0)..=self.until)
+                .next_back()
+            {
+                self.until = t.pred();
+                Some(*t)
+            } else {
+                None
+            };
+        }
         loop {
-            let mut next_conditions = PriorityQueue::with_capacity(self.and_conditions.len());
+            let mut next_and_conditions = PriorityQueue::with_capacity(self.and_conditions.len());
             let mut first = true;
             let mut all = true;
             while let Some((p_diff, mut cs)) = self.and_conditions.pop() {
@@ -298,21 +241,19 @@ impl<'a> GetEvents<'a> {
                         all = false;
                     }
                     let c_len = (cs.cs.len() + cs.remained.len()) as u64;
-                    if c_len != 0 {
-                        next_conditions.push(diff.0 / (c_len * 2) + p_diff / 2, cs);
+                    if c_len == 0 {
+                        return None;
                     }
+                    next_and_conditions.push(diff.0 / (c_len * 2) + p_diff / 2, cs);
                 } else {
                     return None;
                 }
             }
-            self.and_conditions = next_conditions;
+            self.and_conditions = next_and_conditions;
             if all {
                 let c = self.until;
                 self.until = c.pred();
                 return Some(c);
-            }
-            if self.and_conditions.is_empty() {
-                break None;
             }
         }
     }
