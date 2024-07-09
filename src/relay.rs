@@ -1,5 +1,6 @@
 use crate::nostr::{Condition, Event, EventId, Filter, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
+use log::debug;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -49,7 +50,7 @@ impl Db {
     }
 
     pub fn add_event(&mut self, event: Arc<Event>) -> Result<u64, AddEventError> {
-        if let Some(_) = self.id_to_n(event.id) {
+        if self.id_to_n(event.id).is_some() {
             return Err(AddEventError::Duplicated);
         }
         match event.kind {
@@ -57,13 +58,11 @@ impl Db {
                 let author = Condition::Author(event.pubkey);
                 let kind = Condition::Kind(event.kind);
                 let mut i = GetEvents {
-                    since: 0,
                     until: Time(u64::MAX, u64::MAX),
                     and_conditions: PriorityQueue::from([
                         (u64::MAX, ConditionsWithLatest::new(vec![&author])),
                         (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind])),
                     ]),
-                    limit: 2,
                 };
                 if let Some(Time(t, n)) = i.next(self) {
                     let have_newer = match t.cmp(&event.created_at) {
@@ -84,7 +83,7 @@ impl Db {
             30000..=39999 => {
                 fn first_d_value(event: &Event) -> Option<&str> {
                     event.tags.iter().find_map(|t| {
-                        if t.get(0)? == "d" {
+                        if t.first()? == "d" {
                             Some(t.get(1).map(|a| a.as_str()).unwrap_or(""))
                         } else {
                             None
@@ -96,14 +95,12 @@ impl Db {
                     let kind = Condition::Kind(event.kind);
                     let d_tag = Condition::Tag('d', d_value.to_string());
                     let mut i = GetEvents {
-                        since: 0,
                         until: Time(u64::MAX, u64::MAX),
                         and_conditions: PriorityQueue::from([
                             (u64::MAX, ConditionsWithLatest::new(vec![&author])),
                             (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind])),
                             (u64::MAX - 1, ConditionsWithLatest::new(vec![&d_tag])),
                         ]),
-                        limit: 2,
                     };
                     while let Some(Time(t, n)) = i.next(self) {
                         if first_d_value(&self.n_to_event[&n]).map_or(false, |d| d == d_value) {
@@ -206,14 +203,16 @@ impl<'a> ConditionsWithLatest<'a> {
         }
     }
 
-    fn next(&mut self, db: &Db, since: UnixTime, until: Time) -> Option<Time> {
+    fn next(&mut self, db: &Db, until: Time) -> Option<Time> {
         while let Some(c) = self.remained.pop() {
             if let Some((_, t)) = db
                 .conditions
-                .range((Cow::Borrowed(c), Time(since, 0))..=(Cow::Borrowed(c), until))
+                .range((Cow::Borrowed(c), Time::ZERO)..=(Cow::Borrowed(c), until))
                 .next_back()
             {
                 self.cs.push(*t, c);
+            } else {
+                debug!("EOSE with {c:?}");
             }
         }
         while let Some((t, c)) = self.cs.pop() {
@@ -223,10 +222,12 @@ impl<'a> ConditionsWithLatest<'a> {
             }
             if let Some((_, t)) = db
                 .conditions
-                .range((Cow::Borrowed(c), Time(since, 0))..=(Cow::Borrowed(c), until))
+                .range((Cow::Borrowed(c), Time::ZERO)..=(Cow::Borrowed(c), until))
                 .next_back()
             {
                 self.cs.push(*t, c);
+            } else {
+                debug!("EOSE with {c:?}");
             }
         }
         None
@@ -260,9 +261,7 @@ impl Time {
 
 #[derive(Debug)]
 pub struct GetEvents<'a> {
-    since: UnixTime,
     until: Time,
-    limit: u32,
     and_conditions: PriorityQueue<u64, ConditionsWithLatest<'a>>,
 }
 
@@ -276,20 +275,17 @@ impl<'a> GetEvents<'a> {
             and_conditions.push(u64::MAX, ConditionsWithLatest::new(cs.iter().collect()));
         }
         Some(GetEvents {
-            since: filter.since,
             until: Time(filter.until, u64::MAX),
             and_conditions,
-            limit: filter.limit,
         })
     }
 
     pub fn next(&mut self, db: &Db) -> Option<Time> {
-        if self.limit == 0 || self.until == Time::ZERO {
+        if self.until == Time::ZERO {
             return None;
         }
-        self.limit -= 1;
         if self.and_conditions.is_empty() {
-            return if let Some(t) = db.time.range(Time(self.since, 0)..=self.until).next_back() {
+            return if let Some(t) = db.time.range(Time::ZERO..=self.until).next_back() {
                 self.until = t.pred();
                 Some(*t)
             } else {
@@ -301,7 +297,7 @@ impl<'a> GetEvents<'a> {
             let mut first = true;
             let mut all = true;
             while let Some((p_diff, mut cs)) = self.and_conditions.pop() {
-                if let Some(t) = cs.next(db, self.since, self.until) {
+                if let Some(t) = cs.next(db, self.until) {
                     let diff = self.until.minus(t);
                     self.until = t;
                     if first {

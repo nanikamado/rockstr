@@ -23,9 +23,6 @@ impl FromStr for EventId {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub struct PubKey(XOnlyPublicKey);
-
 impl Display for EventId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         LowerHex::fmt(&self.0, f)
@@ -35,6 +32,21 @@ impl Display for EventId {
 impl std::fmt::Debug for EventId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "EventId({})", self)
+    }
+}
+
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub struct PubKey(XOnlyPublicKey);
+
+impl Display for PubKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Debug for PubKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PubKey({})", self)
     }
 }
 
