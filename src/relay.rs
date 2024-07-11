@@ -1,6 +1,5 @@
 use crate::nostr::{Condition, Event, EventId, Filter, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
-use log::debug;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -211,8 +210,6 @@ impl<'a> ConditionsWithLatest<'a> {
                 .next_back()
             {
                 self.cs.push(*t, c);
-            } else {
-                debug!("EOSE with {c:?}");
             }
         }
         while let Some((t, c)) = self.cs.pop() {
@@ -226,8 +223,6 @@ impl<'a> ConditionsWithLatest<'a> {
                 .next_back()
             {
                 self.cs.push(*t, c);
-            } else {
-                debug!("EOSE with {c:?}");
             }
         }
         None

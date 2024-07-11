@@ -823,6 +823,7 @@ dependencies = [
  "hex",
  "itertools",
  "log",
+ "once_cell",
  "parking_lot",
  "rustc-hash",
  "secp256k1",
