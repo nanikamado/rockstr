@@ -50,6 +50,13 @@ impl std::fmt::Debug for PubKey {
     }
 }
 
+impl std::str::FromStr for PubKey {
+    type Err = secp256k1::Error;
+    fn from_str(s: &str) -> Result<PubKey, Self::Err> {
+        Ok(PubKey(XOnlyPublicKey::from_str(s)?))
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Event {
     pub id: EventId,

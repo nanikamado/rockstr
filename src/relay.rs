@@ -1,4 +1,4 @@
-use crate::nostr::{Condition, Event, EventId, Filter, SingleLetterTags};
+use crate::nostr::{Condition, Event, EventId, Filter, PubKey, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
@@ -16,6 +16,7 @@ pub struct Db {
     pub conditions: BTreeSet<(Cow<'static, Condition>, Time)>,
     pub time: BTreeSet<Time>,
     pub deleted: FxHashSet<EventId>,
+    pub blocked_pubkeys: FxHashSet<PubKey>,
 }
 
 impl Default for Db {
@@ -26,6 +27,7 @@ impl Default for Db {
             conditions: Default::default(),
             time: Default::default(),
             deleted: Default::default(),
+            blocked_pubkeys: Default::default(),
         }
     }
 }

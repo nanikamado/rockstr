@@ -15,7 +15,7 @@ use axum::Router;
 use display_as_json::AsJson;
 use error::Error;
 use log::{debug, info, trace};
-use nostr::{ClientToRelay, Event};
+use nostr::{ClientToRelay, Event, PubKey};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use relay::{AddEventError, Db, GetEvents, Time};
@@ -25,6 +25,7 @@ use smallvec::SmallVec;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
@@ -206,13 +207,15 @@ async fn handle_message(
                     let mut expiration = None;
                     let (accepted, message) = if s.len() > MAX_MESSAGE_LENGTH {
                         (false, "invalid: too large event")
-                    } else if !e.verify_hash() {
-                        (false, "invalid: bad event id")
-                    } else if !e.verify_sig() {
-                        (false, "invalid: bad signature")
                     } else {
                         let mut db = state.db.write();
-                        if db.deleted.contains(&id) {
+                        if db.blocked_pubkeys.contains(&e.pubkey) {
+                            (false, "blocked")
+                        } else if !e.verify_hash() {
+                            (false, "invalid: bad event id")
+                        } else if !e.verify_sig() {
+                            (false, "invalid: bad signature")
+                        } else if db.deleted.contains(&id) {
                             (false, "deleted: user requested deletion")
                         } else if e.created_at > now + CREATED_AT_UPPER_LIMIT {
                             (false, "invalid: created_at too early")
@@ -270,11 +273,7 @@ async fn handle_message(
                                     if t < f.since {
                                         break;
                                     }
-                                    let e =
-                                        db.n_to_event.get(&n).unwrap_or_else(|| panic!("n = {n}"));
-                                    if filters.iter().all(|f| !f.matches(e)) {
-                                        log::error!("weird");
-                                    }
+                                    let e = db.n_to_event.get(&n).unwrap();
                                     Message::Text(event_message(&id, e))
                                 };
                                 cs.ws.send(m).await?;
@@ -315,8 +314,13 @@ async fn main() -> Result<(), Error> {
     env_logger::init();
     let broadcast_sender = tokio::sync::broadcast::Sender::new(1000);
     let (event_expiration_sender, event_expiration_receiver) = tokio::sync::mpsc::channel(10);
+    let mut db = Db::default();
+    db.blocked_pubkeys.insert(
+        PubKey::from_str("0a7c232a5c4dd0d472d34ca6e768529dffd4683e1968a236a5c789d86837a856")
+            .unwrap(),
+    );
     let state = Arc::new(AppState {
-        db: Default::default(),
+        db: RwLock::new(db),
         broadcast_sender,
         event_expiration_sender,
     });
