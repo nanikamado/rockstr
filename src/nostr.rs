@@ -1,7 +1,7 @@
 use bitcoin_hashes::{sha256, Hash};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Message, XOnlyPublicKey};
-use serde::de::{self, Visitor};
+use serde::de::{self, IgnoredAny, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -101,11 +101,12 @@ pub struct Filter {
     pub limit: u32,
     #[serde(flatten, deserialize_with = "deserialize_tags")]
     pub conditions: Vec<BTreeSet<Condition>>,
+    pub search: Option<IgnoredAny>,
 }
 
 impl Filter {
     pub fn matches(&self, e: &Event) -> bool {
-        if !(self.since <= e.created_at && e.created_at <= self.until) {
+        if !(self.since <= e.created_at && e.created_at <= self.until) || self.search.is_some() {
             return false;
         }
         let tags: BTreeSet<_> = SingleLetterTags::new(&e.tags)

@@ -264,6 +264,9 @@ pub struct GetEvents<'a> {
 
 impl<'a> GetEvents<'a> {
     pub fn new(filter: &'a Filter) -> Option<Self> {
+        if filter.search.is_some() {
+            return None;
+        }
         let mut and_conditions = PriorityQueue::with_capacity(filter.conditions.len());
         for cs in &filter.conditions {
             if cs.is_empty() {
