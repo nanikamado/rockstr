@@ -14,8 +14,8 @@ use axum::routing::get;
 use axum::Router;
 use display_as_json::AsJson;
 use error::Error;
-use log::{debug, info, trace};
-use nostr::{ClientToRelay, Event, PubKey};
+use log::{debug, info, trace, warn};
+use nostr::{ClientToRelay, Event, FirstTagValue, PubKey, Tag};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use relay::{AddEventError, Db, GetEvents, Time};
@@ -175,14 +175,14 @@ fn event_message(id: &str, e: &Event) -> String {
 }
 
 fn expiration_time(e: &Event) -> Option<u64> {
-    e.tags.iter().find_map(|tag| {
-        let (Some(t), Some(v)) = (tag.first(), tag.get(1)) else {
-            return None;
-        };
-        if t != "expiration" {
+    e.tags.iter().find_map(|Tag(k, v)| {
+        if k != "expiration" {
             return None;
         }
-        v.parse::<u64>().ok()
+        match &v.as_ref()?.0 {
+            FirstTagValue::Hex32(_) => None,
+            FirstTagValue::String(t) => t.parse::<u64>().ok(),
+        }
     })
 }
 
@@ -193,106 +193,55 @@ async fn handle_message(
 ) -> Result<Option<CloseReason>, Error> {
     use axum::extract::ws::Message;
     let continue_ = match m {
-        Message::Text(s) => {
-            let Ok(m): Result<ClientToRelay, _> = serde_json::from_str(&s) else {
-                return Ok(None);
-            };
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            match m {
-                ClientToRelay::Event(e) => {
-                    let id = e.id;
-                    let mut expiration = None;
-                    let (accepted, message) = if s.len() > MAX_MESSAGE_LENGTH {
-                        (false, "invalid: too large event")
-                    } else {
-                        let mut db = state.db.write();
-                        if db.blocked_pubkeys.contains(&e.pubkey) {
-                            (false, "blocked")
-                        } else if !e.verify_hash() {
-                            (false, "invalid: bad event id")
-                        } else if !e.verify_sig() {
-                            (false, "invalid: bad signature")
-                        } else if db.deleted.contains(&id) {
-                            (false, "deleted: user requested deletion")
-                        } else if e.created_at > now + CREATED_AT_UPPER_LIMIT {
-                            (false, "invalid: created_at too early")
-                        } else if (20_000..30_000).contains(&e.kind) {
-                            let _ = state.broadcast_sender.send(e);
-                            (true, "")
-                        } else {
-                            let ex = expiration_time(&e);
-                            if ex.map_or(false, |e| e <= now) {
-                                (false, "invalid: event expired")
-                            } else {
-                                match db.add_event(e.clone()) {
-                                    Ok(n) => {
-                                        let _ = state.broadcast_sender.send(e);
-                                        if db.n_to_event.len() >= 100_000 {
-                                            let oldest = db.time.first().unwrap().1;
-                                            trace!("remove {oldest}");
-                                            db.remove_event(oldest);
+        Message::Text(s) => match serde_json::from_str(&s) {
+            Ok(m) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                match m {
+                    ClientToRelay::Event(e) => {
+                        handle_event(state, cs, e, s.len(), now).await?;
+                        None
+                    }
+                    ClientToRelay::Req { id, filters } => {
+                        debug!("req with {s}");
+                        for f in &filters {
+                            if let Some(mut s) = GetEvents::new(f) {
+                                for _ in 0..f.limit {
+                                    let m = {
+                                        let db = state.db.read();
+                                        let Some(Time(t, n)) = s.next(&db) else {
+                                            break;
+                                        };
+                                        if t < f.since {
+                                            break;
                                         }
-                                        if let Some(e) = ex {
-                                            expiration = Some((e, n));
-                                        }
-                                        (true, "")
-                                    }
-                                    Err(AddEventError::Duplicated) => {
-                                        (true, "duplicate: already have this event")
-                                    }
-                                    Err(AddEventError::HaveNewer) => {
-                                        (true, "duplicate: have a newer event")
-                                    }
+                                        let e = db.n_to_event.get(&n).unwrap();
+                                        Message::Text(event_message(&id, e))
+                                    };
+                                    cs.ws.send(m).await?;
                                 }
                             }
                         }
-                    };
-                    cs.ws
-                        .send(Message::Text(format!(
-                            r#"["OK","{id}",{accepted},"{message}"]"#,
-                        )))
-                        .await?;
-                    if let Some(e) = expiration {
-                        state.event_expiration_sender.send(e).await.unwrap();
+                        cs.ws
+                            .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
+                            .await?;
+                        cs.req.insert(id, filters);
+                        None
                     }
-                    None
-                }
-                ClientToRelay::Req { id, filters } => {
-                    debug!("req with {s}");
-                    for f in &filters {
-                        if let Some(mut s) = GetEvents::new(f) {
-                            for _ in 0..f.limit {
-                                let m = {
-                                    let db = state.db.read();
-                                    let Some(Time(t, n)) = s.next(&db) else {
-                                        break;
-                                    };
-                                    if t < f.since {
-                                        break;
-                                    }
-                                    let e = db.n_to_event.get(&n).unwrap();
-                                    Message::Text(event_message(&id, e))
-                                };
-                                cs.ws.send(m).await?;
-                            }
-                        }
+                    ClientToRelay::Close(id) => {
+                        debug!("close {id}");
+                        cs.req.remove(id.as_ref());
+                        None
                     }
-                    cs.ws
-                        .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
-                        .await?;
-                    cs.req.insert(id, filters);
-                    None
-                }
-                ClientToRelay::Close(id) => {
-                    debug!("close {id}");
-                    cs.req.remove(id.as_ref());
-                    None
                 }
             }
-        }
+            Err(e) => {
+                warn!("parse error: {e}, text = {s:?}");
+                return Ok(None);
+            }
+        },
         Message::Binary(_) => None,
         Message::Ping(a) => {
             cs.ws.send(Message::Pong(a)).await?;
@@ -302,6 +251,68 @@ async fn handle_message(
         Message::Close(_) => Some(CloseReason::WsClosed),
     };
     Ok(continue_)
+}
+
+async fn handle_event(
+    state: &Arc<AppState>,
+    cs: &mut ConnectionState,
+    event: Arc<Event>,
+    event_len: usize,
+    now: u64,
+) -> Result<(), Error> {
+    use axum::extract::ws::Message;
+    let id = event.id;
+    let mut expiration = None;
+    let (accepted, message) = if event_len > MAX_MESSAGE_LENGTH {
+        (false, "invalid: too large event")
+    } else {
+        let mut db = state.db.write();
+        if db.blocked_pubkeys.contains(&event.pubkey) {
+            (false, "blocked")
+        } else if !event.verify_hash() {
+            (false, "invalid: bad event id")
+        } else if !event.verify_sig() {
+            (false, "invalid: bad signature")
+        } else if db.deleted.contains(&id) {
+            (false, "deleted: user requested deletion")
+        } else if event.created_at > now + CREATED_AT_UPPER_LIMIT {
+            (false, "invalid: created_at too early")
+        } else if (20_000..30_000).contains(&event.kind) {
+            let _ = state.broadcast_sender.send(event);
+            (true, "")
+        } else {
+            let ex = expiration_time(&event);
+            if ex.map_or(false, |e| e <= now) {
+                (false, "invalid: event expired")
+            } else {
+                match db.add_event(event.clone()) {
+                    Ok(n) => {
+                        let _ = state.broadcast_sender.send(event);
+                        if db.n_to_event.len() >= 100_000 {
+                            let oldest = db.time.first().unwrap().1;
+                            trace!("remove {oldest}");
+                            db.remove_event(oldest);
+                        }
+                        if let Some(e) = ex {
+                            expiration = Some((e, n));
+                        }
+                        (true, "")
+                    }
+                    Err(AddEventError::Duplicated) => (true, "duplicate: already have this event"),
+                    Err(AddEventError::HaveNewer) => (true, "duplicate: have a newer event"),
+                }
+            }
+        }
+    };
+    cs.ws
+        .send(Message::Text(format!(
+            r#"["OK","{id}",{accepted},"{message}"]"#,
+        )))
+        .await?;
+    if let Some(e) = expiration {
+        state.event_expiration_sender.send(e).await.unwrap();
+    }
+    Ok(())
 }
 
 async fn handler_404(uri: axum::http::Uri) -> Error {

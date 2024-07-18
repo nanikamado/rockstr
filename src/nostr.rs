@@ -2,6 +2,7 @@ use bitcoin_hashes::{sha256, Hash};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Message, XOnlyPublicKey};
 use serde::de::{self, IgnoredAny, Visitor};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -35,6 +36,12 @@ impl std::fmt::Debug for EventId {
     }
 }
 
+impl From<[u8; 32]> for EventId {
+    fn from(value: [u8; 32]) -> Self {
+        EventId(sha256::Hash::from_byte_array(value))
+    }
+}
+
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct PubKey(XOnlyPublicKey);
 
@@ -63,9 +70,97 @@ pub struct Event {
     pub pubkey: PubKey,
     pub created_at: u64,
     pub kind: u32,
-    pub tags: Vec<SmallVec<[String; 3]>>,
+    pub tags: Vec<Tag>,
     pub content: String,
     pub sig: Signature,
+}
+
+#[derive(Debug)]
+pub struct Tag(pub String, pub Option<(FirstTagValue, Vec<String>)>);
+
+impl Serialize for Tag {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut s = serializer.serialize_seq(None)?;
+        s.serialize_element(&self.0)?;
+        match &self.1 {
+            Some((t, ts)) => {
+                s.serialize_element(t)?;
+                for t in ts {
+                    s.serialize_element(t)?;
+                }
+            }
+            None => (),
+        }
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Tag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct TagVisitor;
+
+        impl<'de> Visitor<'de> for TagVisitor {
+            type Value = Tag;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an array")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                use serde::de::Error;
+                let t = seq
+                    .next_element()?
+                    .ok_or_else(|| A::Error::invalid_length(0, &"one or more"))?;
+                if let Some(t2) = seq.next_element()? {
+                    let mut t3 = Vec::new();
+                    while let Some(t) = seq.next_element()? {
+                        t3.push(t);
+                    }
+                    Ok(Tag(t, Some((t2, t3))))
+                } else {
+                    Ok(Tag(t, None))
+                }
+            }
+        }
+
+        deserializer.deserialize_seq(TagVisitor)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[serde(untagged)]
+pub enum FirstTagValue {
+    #[serde(with = "hex::serde")]
+    Hex32([u8; 32]),
+    String(String),
+}
+
+#[test]
+fn tag_value_serde_test() {
+    let t: FirstTagValue = serde_json::from_str(r#""aa""#).unwrap();
+    assert_eq!(t, FirstTagValue::String("aa".to_string()));
+    let t: FirstTagValue = serde_json::from_str(
+        r#""aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""#,
+    )
+    .unwrap();
+    assert_eq!(
+        t,
+        FirstTagValue::Hex32(
+            hex::FromHex::from_hex(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+            .unwrap()
+        )
+    );
 }
 
 impl Event {
@@ -110,7 +205,7 @@ impl Filter {
             return false;
         }
         let tags: BTreeSet<_> = SingleLetterTags::new(&e.tags)
-            .map(|(c, v)| Condition::Tag(c, v))
+            .map(|(c, v)| Condition::Tag(c, v.clone()))
             .collect();
         for c in &self.conditions {
             if !c.contains(&Condition::Author(e.pubkey))
@@ -125,23 +220,25 @@ impl Filter {
     }
 }
 
-pub struct SingleLetterTags<'a>(slice::Iter<'a, SmallVec<[String; 3]>>);
+pub struct SingleLetterTags<'a>(slice::Iter<'a, Tag>);
 
 impl<'a> SingleLetterTags<'a> {
-    pub fn new(tags: &'a [SmallVec<[String; 3]>]) -> Self {
+    pub fn new(tags: &'a [Tag]) -> Self {
         SingleLetterTags(tags.iter())
     }
 }
 
-impl Iterator for SingleLetterTags<'_> {
-    type Item = (char, String);
+impl<'a> Iterator for SingleLetterTags<'a> {
+    type Item = (u8, &'a FirstTagValue);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for t in self.0.by_ref() {
-            if let Some(tag) = t.first() {
-                let mut cs = tag.chars();
-                if let (Some(tag), None) = (cs.next(), cs.next()) {
-                    return Some((tag, t.get(1).map(|a| a.to_string()).unwrap_or_default()));
+        for Tag(t1, t2) in self.0.by_ref() {
+            if t1.len() == 1 {
+                let key = t1.as_bytes()[0];
+                if (b'a'..b'z').contains(&key) || (b'A'..b'Z').contains(&key) {
+                    if let Some((value, _)) = t2 {
+                        return Some((key, value));
+                    }
                 }
             }
         }
@@ -151,7 +248,7 @@ impl Iterator for SingleLetterTags<'_> {
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub enum Condition {
-    Tag(char, String),
+    Tag(u8, FirstTagValue),
     Author(PubKey),
     Kind(u32),
     Id(EventId),
@@ -204,14 +301,11 @@ where
                             .collect(),
                     ),
                     _ => {
-                        let mut chars = key.chars();
-                        if let (Some('#'), Some(c), None) =
-                            (chars.next(), chars.next(), chars.next())
-                        {
+                        if key.len() == 2 && key.starts_with('#') {
                             tags.push(
-                                map.next_value::<Vec<String>>()?
+                                map.next_value::<Vec<FirstTagValue>>()?
                                     .into_iter()
-                                    .map(|v| Condition::Tag(c, v))
+                                    .map(|v| Condition::Tag(key.as_bytes()[1], v))
                                     .collect(),
                             );
                         } else {

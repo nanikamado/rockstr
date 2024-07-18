@@ -1,10 +1,9 @@
-use crate::nostr::{Condition, Event, EventId, Filter, PubKey, SingleLetterTags};
+use crate::nostr::{Condition, Event, EventId, Filter, FirstTagValue, PubKey, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::Arc;
 
 type UnixTime = u64;
@@ -82,10 +81,10 @@ impl Db {
                 }
             }
             30000..=39999 => {
-                fn first_d_value(event: &Event) -> Option<&str> {
+                fn first_d_value(event: &Event) -> Option<&FirstTagValue> {
                     event.tags.iter().find_map(|t| {
-                        if t.first()? == "d" {
-                            Some(t.get(1).map(|a| a.as_str()).unwrap_or(""))
+                        if t.0 == "d" {
+                            t.1.as_ref().map(|(a, _)| a)
                         } else {
                             None
                         }
@@ -94,7 +93,7 @@ impl Db {
                 if let Some(d_value) = first_d_value(&event) {
                     let author = Condition::Author(event.pubkey);
                     let kind = Condition::Kind(event.kind);
-                    let d_tag = Condition::Tag('d', d_value.to_string());
+                    let d_tag = Condition::Tag(b'd', d_value.clone());
                     let mut i = GetEvents {
                         until: Time(u64::MAX, u64::MAX),
                         and_conditions: PriorityQueue::from([
@@ -125,12 +124,11 @@ impl Db {
             }
             5 => {
                 for t in &event.tags {
-                    if let (Some(t), Some(v)) = (t.first(), t.get(1)) {
-                        if let ("e", Ok(e)) = (t.as_ref(), EventId::from_str(v.as_ref())) {
-                            self.deleted.insert(e);
-                            if let Some(n) = self.id_to_n(e) {
-                                self.remove_event(n);
-                            }
+                    if let ("e", Some((FirstTagValue::Hex32(v), _))) = (t.0.as_ref(), &t.1) {
+                        let e = EventId::from(*v);
+                        self.deleted.insert(e);
+                        if let Some(n) = self.id_to_n(e) {
+                            self.remove_event(n);
                         }
                     }
                 }
@@ -141,7 +139,7 @@ impl Db {
         self.next_n = n + 1;
         for (tag, value) in SingleLetterTags::new(&event.tags) {
             self.conditions.insert((
-                Cow::Owned(Condition::Tag(tag, value)),
+                Cow::Owned(Condition::Tag(tag, value.clone())),
                 Time(event.created_at, n),
             ));
         }
@@ -166,7 +164,7 @@ impl Db {
         if let Some(event) = self.n_to_event.remove(&n) {
             for (tag, value) in SingleLetterTags::new(&event.tags) {
                 self.conditions.remove(&(
-                    Cow::Owned(Condition::Tag(tag, value)),
+                    Cow::Owned(Condition::Tag(tag, value.clone())),
                     Time(event.created_at, n),
                 ));
             }
