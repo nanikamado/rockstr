@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display, LowerHex};
-use std::io::Write;
+use std::io::{self, Write};
 use std::slice;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -252,6 +252,55 @@ pub enum Condition {
     Author(PubKey),
     Kind(u32),
     Id(EventId),
+}
+
+impl Condition {
+    pub fn write_bytes(&self, buff: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Condition::Id(a) => {
+                buff.push(0);
+                buff.write_all(a.0.as_byte_array())?;
+                buff.push(0);
+            }
+            Condition::Author(a) => {
+                buff.push(0);
+                buff.write_all(&a.0.serialize())?;
+                buff.push(1);
+            }
+            Condition::Tag(c, FirstTagValue::Hex32(a)) => {
+                buff.push(0);
+                buff.write_all(a)?;
+                buff.push(*c);
+            }
+            Condition::Tag(c, FirstTagValue::String(a)) => {
+                buff.push(*c);
+                buff.write_all(a.as_bytes())?;
+                buff.push(0xff);
+            }
+            Condition::Kind(k) => {
+                buff.push(1);
+                buff.write_all(&k.to_be_bytes())?;
+                buff.push(0xff);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Condition::Id(_)
+            | Condition::Author(_)
+            | Condition::Tag(_, FirstTagValue::Hex32(_)) => 34,
+            Condition::Tag(_, FirstTagValue::String(a)) => a.len() + 2,
+            Condition::Kind(_) => 6,
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut buff = Vec::with_capacity(10);
+        self.write_bytes(&mut buff).unwrap();
+        buff
+    }
 }
 
 fn limit_default() -> u32 {

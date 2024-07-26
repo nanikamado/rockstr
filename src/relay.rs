@@ -1,18 +1,21 @@
 use crate::nostr::{Condition, Event, EventId, Filter, FirstTagValue, PubKey, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
+use qp_trie::Trie;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
+use std::io;
 use std::sync::Arc;
 
+type TrieSet<K> = Trie<K, ()>;
 type UnixTime = u64;
 
 #[derive(Debug)]
 pub struct Db {
     pub next_n: u64,
     pub n_to_event: FxHashMap<u64, Arc<Event>>,
-    pub conditions: BTreeSet<(Cow<'static, Condition>, Time)>,
+    pub conditions: TrieSet<Vec<u8>>,
     pub time: BTreeSet<Time>,
     pub deleted: FxHashSet<EventId>,
     pub blocked_pubkeys: FxHashSet<PubKey>,
@@ -37,16 +40,19 @@ pub enum AddEventError {
     HaveNewer,
 }
 
+fn key_to_vec(condition: &Condition, time: Time) -> Vec<u8> {
+    let mut buff = Vec::with_capacity(16);
+    condition.write_bytes(&mut buff).unwrap();
+    time.write_bytes(&mut buff).unwrap();
+    buff
+}
+
 impl Db {
     pub fn id_to_n(&self, id: EventId) -> Option<u64> {
         let id = Condition::Id(id);
-        Some(
-            self.conditions
-                .range((Cow::Borrowed(&id), Time::ZERO)..(Cow::Borrowed(&id), Time::MAX))
-                .next()?
-                .1
-                 .1,
-        )
+        let s = self.conditions.iter_prefix(&id.to_vec()).next()?.0;
+        let s = s[32 + 2 + 8..].try_into().unwrap();
+        Some(u64::from_be_bytes(s))
     }
 
     pub fn add_event(&mut self, event: Arc<Event>) -> Result<u64, AddEventError> {
@@ -54,7 +60,7 @@ impl Db {
             return Err(AddEventError::Duplicated);
         }
         match event.kind {
-            0 | 3 | 10000..=19999 => {
+            0 | 3 | 10000..20000 => {
                 let author = Condition::Author(event.pubkey);
                 let kind = Condition::Kind(event.kind);
                 let mut i = GetEvents {
@@ -80,7 +86,7 @@ impl Db {
                     }
                 }
             }
-            30000..=39999 => {
+            30000..40000 => {
                 fn first_d_value(event: &Event) -> Option<&FirstTagValue> {
                     event.tags.iter().find_map(|t| {
                         if t.0 == "d" {
@@ -138,23 +144,26 @@ impl Db {
         let n = self.next_n;
         self.next_n = n + 1;
         for (tag, value) in SingleLetterTags::new(&event.tags) {
-            self.conditions.insert((
-                Cow::Owned(Condition::Tag(tag, value.clone())),
-                Time(event.created_at, n),
-            ));
+            self.conditions.insert(
+                key_to_vec(
+                    &Condition::Tag(tag, value.clone()),
+                    Time(event.created_at, n),
+                ),
+                (),
+            );
         }
-        self.conditions.insert((
-            Cow::Owned(Condition::Author(event.pubkey)),
-            Time(event.created_at, n),
-        ));
-        self.conditions.insert((
-            Cow::Owned(Condition::Id(event.id)),
-            Time(event.created_at, n),
-        ));
-        self.conditions.insert((
-            Cow::Owned(Condition::Kind(event.kind)),
-            Time(event.created_at, n),
-        ));
+        self.conditions.insert(
+            key_to_vec(&Condition::Author(event.pubkey), Time(event.created_at, n)),
+            (),
+        );
+        self.conditions.insert(
+            key_to_vec(&Condition::Id(event.id), Time(event.created_at, n)),
+            (),
+        );
+        self.conditions.insert(
+            key_to_vec(&Condition::Kind(event.kind), Time(event.created_at, n)),
+            (),
+        );
         self.time.insert(Time(event.created_at, n));
         self.n_to_event.insert(n, event);
         Ok(n)
@@ -163,21 +172,21 @@ impl Db {
     pub fn remove_event(&mut self, n: u64) -> bool {
         if let Some(event) = self.n_to_event.remove(&n) {
             for (tag, value) in SingleLetterTags::new(&event.tags) {
-                self.conditions.remove(&(
-                    Cow::Owned(Condition::Tag(tag, value.clone())),
+                self.conditions.remove(&key_to_vec(
+                    &Condition::Tag(tag, value.clone()),
                     Time(event.created_at, n),
                 ));
             }
-            self.conditions.remove(&(
-                Cow::Owned(Condition::Author(event.pubkey)),
+            self.conditions.remove(&key_to_vec(
+                &Condition::Author(event.pubkey),
                 Time(event.created_at, n),
             ));
-            self.conditions.remove(&(
-                Cow::Owned(Condition::Id(event.id)),
+            self.conditions.remove(&key_to_vec(
+                &Condition::Id(event.id),
                 Time(event.created_at, n),
             ));
-            self.conditions.remove(&(
-                Cow::Owned(Condition::Kind(event.kind)),
+            self.conditions.remove(&key_to_vec(
+                &Condition::Kind(event.kind),
                 Time(event.created_at, n),
             ));
             self.time.remove(&Time(event.created_at, n));
@@ -190,42 +199,34 @@ impl Db {
 
 #[derive(Debug)]
 struct ConditionsWithLatest<'a> {
-    cs: PriorityQueue<Time, &'a Condition>,
+    or_conditions: PriorityQueue<Time, &'a Condition>,
     remained: Vec<&'a Condition>,
 }
 
 impl<'a> ConditionsWithLatest<'a> {
     fn new(conditions: Vec<&'a Condition>) -> Self {
         ConditionsWithLatest {
-            cs: PriorityQueue::new(),
+            or_conditions: PriorityQueue::new(),
             remained: conditions,
         }
     }
 
     fn next(&mut self, db: &Db, until: Time) -> Option<Time> {
         while let Some(c) = self.remained.pop() {
-            if let Some((_, t)) = db
-                .conditions
-                .range((Cow::Borrowed(c), Time::ZERO)..=(Cow::Borrowed(c), until))
-                .next_back()
-            {
-                self.cs.push(*t, c);
+            if let Some((s, _)) = db.conditions.iter_prefix(&Cow::Borrowed(c).to_vec()).next() {
+                let l = c.byte_len();
+                let t = Time::from_slice(&s[l..]);
+                if t <= until {
+                    self.or_conditions.push(t, c);
+                }
             }
         }
-        while let Some((t, c)) = self.cs.pop() {
-            if t <= until {
-                self.remained.push(c);
-                return Some(t);
-            }
-            if let Some((_, t)) = db
-                .conditions
-                .range((Cow::Borrowed(c), Time::ZERO)..=(Cow::Borrowed(c), until))
-                .next_back()
-            {
-                self.cs.push(*t, c);
-            }
+        if let Some((t, c)) = self.or_conditions.pop() {
+            self.remained.push(c);
+            Some(t)
+        } else {
+            None
         }
-        None
     }
 }
 
@@ -250,8 +251,21 @@ impl Time {
         }
     }
 
-    const MAX: Self = Self(u64::MAX, u64::MAX);
     const ZERO: Self = Self(0, 0);
+
+    fn write_bytes(self, buff: &mut Vec<u8>) -> io::Result<()> {
+        use std::io::Write;
+        buff.write_all(&(!self.0).to_be_bytes())?;
+        buff.write_all(&self.1.to_be_bytes())?;
+        Ok(())
+    }
+
+    fn from_slice(s: &[u8]) -> Self {
+        debug_assert_eq!(s.len(), 16);
+        let t = !u64::from_be_bytes(s[0..8].try_into().unwrap());
+        let n = u64::from_be_bytes(s[8..16].try_into().unwrap());
+        Time(t, n)
+    }
 }
 
 #[derive(Debug)]
@@ -303,7 +317,7 @@ impl<'a> GetEvents<'a> {
                     } else if diff != (0, 0) {
                         all = false;
                     }
-                    let c_len = (cs.cs.len() + cs.remained.len()) as u64;
+                    let c_len = (cs.or_conditions.len() + cs.remained.len()) as u64;
                     if c_len == 0 {
                         return None;
                     }

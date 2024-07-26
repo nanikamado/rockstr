@@ -16,7 +16,6 @@ use display_as_json::AsJson;
 use error::Error;
 use log::{debug, info, trace, warn};
 use nostr::{ClientToRelay, Event, FirstTagValue, PubKey, Tag};
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use relay::{AddEventError, Db, GetEvents, Time};
 use rustc_hash::FxHashMap;
@@ -26,7 +25,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock as Lazy};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
 
