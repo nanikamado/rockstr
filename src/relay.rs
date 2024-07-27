@@ -1,6 +1,6 @@
 use crate::nostr::{Condition, Event, EventId, Filter, FirstTagValue, PubKey, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
-use rocksdb::{IteratorMode, DB as Rocks};
+use rocksdb::{DBIteratorWithThreadMode as RocksIter, IteratorMode, DB as Rocks};
 use rustc_hash::FxHashSet;
 use std::fmt::Debug;
 use std::fs::create_dir_all;
@@ -132,27 +132,33 @@ impl Db {
             0 | 3 | 10000..20000 => {
                 let author = Condition::Author(event.pubkey);
                 let kind = Condition::Kind(event.kind);
-                let mut i = GetEvents {
-                    until: Time(u64::MAX, u64::MAX),
-                    and_conditions: PriorityQueue::from([
-                        (u64::MAX, ConditionsWithLatest::new(vec![&author])),
-                        (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind])),
-                    ]),
-                };
-                if let Some(Time(t, n)) = i.next(self) {
-                    let have_newer = match t.cmp(&event.created_at) {
-                        std::cmp::Ordering::Less => false,
-                        std::cmp::Ordering::Equal => {
-                            let e = &self.n_to_event_get(n).unwrap();
-                            e.id > event.id
-                        }
-                        std::cmp::Ordering::Greater => true,
+                let mut outdated = Vec::new();
+                {
+                    let mut i = GetEvents {
+                        until: Time(u64::MAX, u64::MAX),
+                        and_conditions: PriorityQueue::from([
+                            (u64::MAX, ConditionsWithLatest::new(vec![&author], self)),
+                            (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind], self)),
+                        ]),
                     };
-                    if have_newer {
-                        return Err(AddEventError::HaveNewer);
-                    } else {
-                        self.remove_event(n);
+                    if let Some(Time(t, n)) = i.next(self) {
+                        let have_newer = match t.cmp(&event.created_at) {
+                            std::cmp::Ordering::Less => false,
+                            std::cmp::Ordering::Equal => {
+                                let e = &self.n_to_event_get(n).unwrap();
+                                e.id > event.id
+                            }
+                            std::cmp::Ordering::Greater => true,
+                        };
+                        if have_newer {
+                            return Err(AddEventError::HaveNewer);
+                        } else {
+                            outdated.push(n);
+                        }
                     }
+                }
+                for n in outdated {
+                    self.remove_event(n);
                 }
             }
             30000..40000 => {
@@ -169,29 +175,35 @@ impl Db {
                     let author = Condition::Author(event.pubkey);
                     let kind = Condition::Kind(event.kind);
                     let d_tag = Condition::Tag(b'd', d_value.clone());
-                    let mut i = GetEvents {
-                        until: Time(u64::MAX, u64::MAX),
-                        and_conditions: PriorityQueue::from([
-                            (u64::MAX, ConditionsWithLatest::new(vec![&author])),
-                            (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind])),
-                            (u64::MAX - 1, ConditionsWithLatest::new(vec![&d_tag])),
-                        ]),
-                    };
-                    while let Some(Time(t, n)) = i.next(self) {
-                        let e = self.n_to_event_get(n).unwrap();
-                        if first_d_value(&e).map_or(false, |d| d == d_value) {
-                            let have_newer = match t.cmp(&event.created_at) {
-                                std::cmp::Ordering::Less => false,
-                                std::cmp::Ordering::Equal => e.id > event.id,
-                                std::cmp::Ordering::Greater => true,
-                            };
-                            if have_newer {
-                                return Err(AddEventError::HaveNewer);
-                            } else {
-                                self.remove_event(n);
-                                break;
+                    let mut outdated = Vec::new();
+                    {
+                        let mut i = GetEvents {
+                            until: Time(u64::MAX, u64::MAX),
+                            and_conditions: PriorityQueue::from([
+                                (u64::MAX, ConditionsWithLatest::new(vec![&author], self)),
+                                (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind], self)),
+                                (u64::MAX - 1, ConditionsWithLatest::new(vec![&d_tag], self)),
+                            ]),
+                        };
+                        while let Some(Time(t, n)) = i.next(self) {
+                            let e = self.n_to_event_get(n).unwrap();
+                            if first_d_value(&e).map_or(false, |d| d == d_value) {
+                                let have_newer = match t.cmp(&event.created_at) {
+                                    std::cmp::Ordering::Less => false,
+                                    std::cmp::Ordering::Equal => e.id > event.id,
+                                    std::cmp::Ordering::Greater => true,
+                                };
+                                if have_newer {
+                                    return Err(AddEventError::HaveNewer);
+                                } else {
+                                    outdated.push(n);
+                                    break;
+                                }
                             }
                         }
+                    }
+                    for n in outdated {
+                        self.remove_event(n);
                     }
                 }
             }
@@ -211,7 +223,6 @@ impl Db {
         let n = self.next_n;
         self.next_n = n + 1;
         for (tag, value) in SingleLetterTags::new(&event.tags) {
-            // self.conditions.put(key, value)
             self.conditions
                 .put(
                     key_to_vec(
@@ -282,36 +293,67 @@ impl Db {
 
 type ConditionVec = Vec<u8>;
 
+struct ConditionAndIter<'a> {
+    condition: Vec<u8>,
+    db: RocksIter<'a, Rocks>,
+}
+
+impl Debug for ConditionAndIter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&self.condition, f)
+    }
+}
+
 #[derive(Debug)]
-struct ConditionsWithLatest {
-    or_conditions: PriorityQueue<Time, ConditionVec>,
+pub struct ConditionsWithLatest<'a> {
+    or_conditions: PriorityQueue<Time, ConditionAndIter<'a>>,
+    remained: Vec<ConditionAndIter<'a>>,
+}
+
+#[derive(Debug)]
+pub struct ConditionsWithLatestStopped {
+    or_conditions: Vec<(Time, ConditionVec)>,
     remained: Vec<ConditionVec>,
 }
 
-impl ConditionsWithLatest {
-    fn new(conditions: Vec<&Condition>) -> Self {
+impl<'a> ConditionsWithLatest<'a> {
+    fn new(conditions: Vec<&Condition>, db: &'a Db) -> Self {
         ConditionsWithLatest {
             or_conditions: PriorityQueue::new(),
             remained: conditions
                 .into_iter()
-                .map(|condition| condition.to_vec())
+                .map(|condition| ConditionAndIter {
+                    condition: condition.to_vec(),
+                    db: db.conditions.iterator(IteratorMode::Start),
+                })
                 .collect(),
         }
     }
 
-    fn next(&mut self, db: &Db, until: Time) -> Option<Time> {
-        while let Some(mut c) = self.remained.pop() {
+    fn next(&mut self, until: Time) -> Option<Time> {
+        while let Some(ConditionAndIter {
+            condition: mut c,
+            db: mut i,
+        }) = self.remained.pop()
+        {
             let c_len = c.len();
             until.write_bytes(&mut c).unwrap();
-            let mut i = db
-                .conditions
-                .iterator(rocksdb::IteratorMode::From(&c, rocksdb::Direction::Reverse));
+            i.set_mode(rocksdb::IteratorMode::From(&c, rocksdb::Direction::Reverse));
+            // let mut i = db
+            //     .conditions
+            //     .iterator(rocksdb::IteratorMode::From(&c, rocksdb::Direction::Reverse));
             c.truncate(c_len);
             if let Some(a) = i.next() {
                 let s = a.unwrap().0;
                 if s.starts_with(&c) {
                     let t = Time::from_slice(&s[c_len..]);
-                    self.or_conditions.push(t, c);
+                    self.or_conditions.push(
+                        t,
+                        ConditionAndIter {
+                            condition: c,
+                            db: i,
+                        },
+                    );
                 }
             }
         }
@@ -320,6 +362,45 @@ impl ConditionsWithLatest {
             Some(t)
         } else {
             None
+        }
+    }
+
+    pub fn stop(self) -> ConditionsWithLatestStopped {
+        ConditionsWithLatestStopped {
+            or_conditions: self
+                .or_conditions
+                .into_iter()
+                .map(|(p, c)| (p, c.condition))
+                .collect(),
+            remained: self.remained.into_iter().map(|c| c.condition).collect(),
+        }
+    }
+}
+
+impl ConditionsWithLatestStopped {
+    pub fn restart(self, db: &Db) -> ConditionsWithLatest {
+        ConditionsWithLatest {
+            or_conditions: self
+                .or_conditions
+                .into_iter()
+                .map(|(p, condition)| {
+                    (
+                        p,
+                        ConditionAndIter {
+                            condition,
+                            db: db.conditions.iterator(IteratorMode::Start),
+                        },
+                    )
+                })
+                .collect(),
+            remained: self
+                .remained
+                .into_iter()
+                .map(|condition| ConditionAndIter {
+                    condition,
+                    db: db.conditions.iterator(IteratorMode::Start),
+                })
+                .collect(),
         }
     }
 }
@@ -369,22 +450,25 @@ impl Time {
 }
 
 #[derive(Debug)]
-pub struct GetEvents {
-    until: Time,
-    and_conditions: PriorityQueue<u64, ConditionsWithLatest>,
+pub struct GetEvents<'a> {
+    pub until: Time,
+    pub and_conditions: PriorityQueue<u64, ConditionsWithLatest<'a>>,
 }
 
-impl GetEvents {
-    pub fn new(filter: &Filter) -> Option<Self> {
+impl<'a> GetEvents<'a> {
+    pub fn new(filter: &Filter, db: &'a Db) -> Option<Self> {
         if filter.search.is_some() {
             return None;
         }
         let mut and_conditions = PriorityQueue::with_capacity(filter.conditions.len());
-        for cs in &filter.conditions {
+        for (priority, cs) in &filter.conditions {
             if cs.is_empty() {
                 return None;
             }
-            and_conditions.push(u64::MAX, ConditionsWithLatest::new(cs.iter().collect()));
+            and_conditions.push(
+                *priority,
+                ConditionsWithLatest::new(cs.iter().collect(), db),
+            );
         }
         Some(GetEvents {
             until: Time(filter.until, u64::MAX),
@@ -414,7 +498,7 @@ impl GetEvents {
             let mut first = true;
             let mut all = true;
             while let Some((p_diff, mut cs)) = self.and_conditions.pop() {
-                if let Some(t) = cs.next(db, self.until) {
+                if let Some(t) = cs.next(self.until) {
                     let diff = self.until.minus(t);
                     self.until = t;
                     if first {
@@ -437,6 +521,35 @@ impl GetEvents {
                 self.until = c.pred();
                 return Some(c);
             }
+        }
+    }
+
+    pub fn stop(self) -> GetEventsStopped {
+        GetEventsStopped {
+            until: self.until,
+            and_conditions: self
+                .and_conditions
+                .into_iter()
+                .map(|(p, c)| (p, c.stop()))
+                .collect(),
+        }
+    }
+}
+
+pub struct GetEventsStopped {
+    pub until: Time,
+    pub and_conditions: Vec<(u64, ConditionsWithLatestStopped)>,
+}
+
+impl GetEventsStopped {
+    pub fn restart<'a>(self, db: &'a Db) -> GetEvents<'a> {
+        GetEvents {
+            until: self.until,
+            and_conditions: self
+                .and_conditions
+                .into_iter()
+                .map(|(p, c)| (p, c.restart(db)))
+                .collect(),
         }
     }
 }

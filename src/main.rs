@@ -20,7 +20,7 @@ use log::{debug, info, warn};
 use nostr::{ClientToRelay, Event, FirstTagValue, PubKey, Tag};
 use parking_lot::RwLock;
 use rand::RngCore;
-use relay::{AddEventError, Db, GetEvents, Time};
+use relay::{AddEventError, Db, GetEvents, GetEventsStopped, Time};
 use rustc_hash::FxHashMap;
 use serde_json::json;
 use smallvec::SmallVec;
@@ -215,23 +215,55 @@ async fn handle_message(
                     }
                     ClientToRelay::Req { id, filters } => {
                         debug!("req with {s}");
-                        for f in &filters {
-                            let Some(mut s) = GetEvents::new(f) else {
-                                continue;
-                            };
-                            for _ in 0..f.limit {
-                                let m = {
+                        'filters_loop: for f in &filters {
+                            let mut limit = f.limit;
+                            enum St {
+                                Init,
+                                Middle(GetEventsStopped),
+                                End,
+                            }
+                            let mut continuation = St::Init;
+                            loop {
+                                let mut ms = Vec::with_capacity(100);
+                                continuation = {
                                     let db = state.db.read();
-                                    let Some(Time(t, n)) = s.next(&db) else {
-                                        break;
+                                    let mut s = match continuation {
+                                        St::Init => {
+                                            let Some(s) = GetEvents::new(f, &db) else {
+                                                continue 'filters_loop;
+                                            };
+                                            s
+                                        }
+                                        St::Middle(s) => s.restart(&db),
+                                        St::End => panic!(),
                                     };
-                                    if t < f.since {
-                                        break;
+                                    loop {
+                                        if limit == 0 {
+                                            break St::End;
+                                        }
+                                        limit -= 1;
+                                        let m = {
+                                            let Some(Time(t, n)) = s.next(&db) else {
+                                                break St::End;
+                                            };
+                                            if t < f.since {
+                                                break St::End;
+                                            }
+                                            let e = db.n_to_event_get(n).unwrap();
+                                            Message::Text(event_message(&id, &e))
+                                        };
+                                        ms.push(m);
+                                        if ms.len() >= 100 {
+                                            break St::Middle(s.stop());
+                                        }
                                     }
-                                    let e = db.n_to_event_get(n).unwrap();
-                                    Message::Text(event_message(&id, &e))
                                 };
-                                cs.ws.send(m).await?;
+                                for m in ms {
+                                    cs.ws.send(m).await?;
+                                }
+                                if matches!(continuation, St::End) {
+                                    continue 'filters_loop;
+                                }
                             }
                         }
                         cs.ws

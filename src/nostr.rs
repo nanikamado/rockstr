@@ -192,6 +192,8 @@ impl Event {
     }
 }
 
+type Priority = u64;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Filter {
     #[serde(default)]
@@ -201,7 +203,7 @@ pub struct Filter {
     #[serde(default = "limit_default")]
     pub limit: u32,
     #[serde(flatten, deserialize_with = "deserialize_tags")]
-    pub conditions: Vec<BTreeSet<Condition>>,
+    pub conditions: Vec<(Priority, BTreeSet<Condition>)>,
     pub search: Option<IgnoredAny>,
 }
 
@@ -213,7 +215,7 @@ impl Filter {
         let tags: BTreeSet<_> = SingleLetterTags::new(&e.tags)
             .map(|(c, v)| Condition::Tag(c, v.clone()))
             .collect();
-        for c in &self.conditions {
+        for (_, c) in &self.conditions {
             if !c.contains(&Condition::Author(e.pubkey))
                 && !c.contains(&Condition::Kind(e.kind))
                 && !c.contains(&Condition::Id(e.id))
@@ -317,14 +319,16 @@ fn until_default() -> u64 {
     u64::MAX
 }
 
-fn deserialize_tags<'de, D>(deserializer: D) -> Result<Vec<BTreeSet<Condition>>, D::Error>
+fn deserialize_tags<'de, D>(
+    deserializer: D,
+) -> Result<Vec<(Priority, BTreeSet<Condition>)>, D::Error>
 where
     D: Deserializer<'de>,
 {
     struct TagsVisitor;
 
     impl<'de> Visitor<'de> for TagsVisitor {
-        type Value = Vec<BTreeSet<Condition>>;
+        type Value = Vec<(Priority, BTreeSet<Condition>)>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             formatter.write_str("a map")
@@ -337,32 +341,46 @@ where
             let mut tags = Vec::new();
             while let Some(key) = map.next_key::<String>()? {
                 match key.as_str() {
-                    "authors" => tags.push(
-                        map.next_value::<Vec<PubKey>>()?
+                    "authors" => {
+                        let s = map
+                            .next_value::<Vec<PubKey>>()?
                             .into_iter()
                             .map(Condition::Author)
-                            .collect(),
-                    ),
-                    "kinds" => tags.push(
-                        map.next_value::<Vec<u32>>()?
+                            .collect();
+                        tags.push((u64::MAX - 3, s))
+                    }
+                    "kinds" => {
+                        let s = map
+                            .next_value::<Vec<u32>>()?
                             .into_iter()
                             .map(Condition::Kind)
-                            .collect(),
-                    ),
-                    "ids" => tags.push(
-                        map.next_value::<Vec<EventId>>()?
+                            .collect();
+                        tags.push((u64::MAX - 5, s))
+                    }
+                    "ids" => {
+                        let s = map
+                            .next_value::<Vec<EventId>>()?
                             .into_iter()
                             .map(Condition::Id)
-                            .collect(),
-                    ),
+                            .collect();
+                        tags.push((u64::MAX, s))
+                    }
                     _ => {
                         if key.len() == 2 && key.starts_with('#') {
-                            tags.push(
-                                map.next_value::<Vec<FirstTagValue>>()?
-                                    .into_iter()
-                                    .map(|v| Condition::Tag(key.as_bytes()[1], v))
-                                    .collect(),
-                            );
+                            let t = key.as_bytes()[1];
+                            let s = map
+                                .next_value::<Vec<FirstTagValue>>()?
+                                .into_iter()
+                                .map(|v| Condition::Tag(t, v))
+                                .collect();
+                            let priority = if t == b'e' {
+                                u64::MAX - 1
+                            } else if t == b'p' {
+                                u64::MAX - 2
+                            } else {
+                                u64::MAX - 4
+                            };
+                            tags.push((priority, s));
                         } else {
                             map.next_value::<serde::de::IgnoredAny>()?;
                         }

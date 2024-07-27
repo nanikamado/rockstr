@@ -50,10 +50,30 @@ impl<K: Ord, V> PriorityQueue<K, V> {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.0.iter().map(|HeapValue(k, v)| (k, v))
+    }
+
+    pub fn into_iter(self) -> impl Iterator<Item = (K, V)> {
+        self.0.into_iter().map(|HeapValue(k, v)| (k, v))
+    }
 }
 
 impl<K: Ord, V, const N: usize> From<[(K, V); N]> for PriorityQueue<K, V> {
     fn from(arr: [(K, V); N]) -> Self {
         Self(BinaryHeap::from_iter(arr.map(|(k, v)| HeapValue(k, v))))
+    }
+}
+
+impl<K: Ord, V> FromIterator<(K, V)> for PriorityQueue<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let mut c = PriorityQueue::new();
+
+        for (k, v) in iter {
+            c.push(k, v);
+        }
+
+        c
     }
 }
