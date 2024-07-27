@@ -25,8 +25,8 @@ pub async fn wait_expiration(
         tokio::select! {
             m = event_expiration_receiver.recv() => {
                 match m {
-                    Some(Time(t, n)) => {
-                        expiration_queue.put(Time(t, n).to_vec(), []).unwrap();
+                    Some(t) => {
+                        expiration_queue.put(t.to_vec(), []).unwrap();
                     }
                     None => break,
                 }
@@ -42,7 +42,7 @@ pub async fn wait_expiration(
 
 fn first(queue: &Rocks) -> Option<Box<[u8]>> {
     queue
-        .iterator(rocksdb::IteratorMode::End)
+        .iterator(rocksdb::IteratorMode::Start)
         .next()
         .map(|a| a.unwrap().0)
 }
