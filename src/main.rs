@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::Router;
 use display_as_json::AsJson;
 use error::Error;
-use log::{debug, info, trace, warn};
+use log::{debug, info, warn};
 use nostr::{ClientToRelay, Event, FirstTagValue, PubKey, Tag};
 use parking_lot::RwLock;
 use rand::RngCore;
@@ -229,8 +229,8 @@ async fn handle_message(
                                     if t < f.since {
                                         break;
                                     }
-                                    let e = db.n_to_event.get(&n).unwrap();
-                                    Message::Text(event_message(&id, e))
+                                    let e = db.n_to_event_get(n).unwrap();
+                                    Message::Text(event_message(&id, &e))
                                 };
                                 cs.ws.send(m).await?;
                             }
@@ -284,7 +284,7 @@ async fn handle_event(
             (false, "invalid: bad event id")
         } else if !event.verify_sig() {
             (false, "invalid: bad signature")
-        } else if db.deleted.contains(&id) {
+        } else if db.is_deleted(&id) {
             (false, "deleted: user requested deletion")
         } else if event.created_at > now + CREATED_AT_UPPER_LIMIT {
             (false, "invalid: created_at too early")
@@ -301,11 +301,11 @@ async fn handle_event(
                 match db.add_event(event.clone()) {
                     Ok(n) => {
                         let _ = state.broadcast_sender.send(event);
-                        if db.n_to_event.len() >= 100_000 {
-                            let oldest = db.time.first().unwrap().1;
-                            trace!("remove {oldest}");
-                            db.remove_event(oldest);
-                        }
+                        // if db.n_to_event.len() >= 100_000 {
+                        //     let oldest = db.time.first().unwrap().1;
+                        //     trace!("remove {oldest}");
+                        //     db.remove_event(oldest);
+                        // }
                         if let Some(e) = ex {
                             expiration = Some((e, n));
                         }

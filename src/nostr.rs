@@ -42,6 +42,12 @@ impl From<[u8; 32]> for EventId {
     }
 }
 
+impl EventId {
+    pub fn as_byte_array(&self) -> &[u8; 32] {
+        self.0.as_byte_array()
+    }
+}
+
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct PubKey(XOnlyPublicKey);
 
