@@ -354,14 +354,14 @@ impl Time {
         Ok(())
     }
 
-    fn from_slice(s: &[u8]) -> Self {
+    pub fn from_slice(s: &[u8]) -> Self {
         debug_assert_eq!(s.len(), 16);
         let t = u64::from_be_bytes(s[0..8].try_into().unwrap());
         let n = u64::from_be_bytes(s[8..16].try_into().unwrap());
         Time(t, n)
     }
 
-    fn to_vec(self) -> Vec<u8> {
+    pub fn to_vec(self) -> Vec<u8> {
         let mut buff = Vec::with_capacity(16);
         self.write_bytes(&mut buff).unwrap();
         buff

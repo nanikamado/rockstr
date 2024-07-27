@@ -1,5 +1,6 @@
 mod display_as_json;
 mod error;
+mod expiration_queue;
 mod nostr;
 mod priority_queue;
 mod relay;
@@ -14,6 +15,7 @@ use axum::routing::get;
 use axum::Router;
 use display_as_json::AsJson;
 use error::Error;
+use expiration_queue::wait_expiration;
 use log::{debug, info, warn};
 use nostr::{ClientToRelay, Event, FirstTagValue, PubKey, Tag};
 use parking_lot::RwLock;
@@ -22,13 +24,10 @@ use relay::{AddEventError, Db, GetEvents, Time};
 use rustc_hash::FxHashMap;
 use serde_json::json;
 use smallvec::SmallVec;
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock as Lazy};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::Instant;
 
 const BIND_ADDRESS: &str = "127.0.0.1:8017";
 
@@ -36,7 +35,7 @@ const BIND_ADDRESS: &str = "127.0.0.1:8017";
 pub struct AppState {
     db: RwLock<Db>,
     broadcast_sender: tokio::sync::broadcast::Sender<Arc<Event>>,
-    event_expiration_sender: tokio::sync::mpsc::Sender<(u64, u64)>,
+    event_expiration_sender: tokio::sync::mpsc::Sender<Time>,
 }
 
 pub async fn listen(state: Arc<AppState>) -> Result<(), Error> {
@@ -307,7 +306,7 @@ async fn handle_event(
                         //     db.remove_event(oldest);
                         // }
                         if let Some(e) = ex {
-                            expiration = Some((e, n));
+                            expiration = Some(Time(e, n));
                         }
                         (true, "")
                     }
@@ -372,56 +371,4 @@ async fn dead_lock_detection() -> Result<(), Error> {
             }
         }
     }
-}
-
-async fn wait_expiration(
-    state: Arc<AppState>,
-    mut event_expiration_receiver: tokio::sync::mpsc::Receiver<(u64, u64)>,
-) -> Result<(), Error> {
-    let far_future = far_future();
-    let mut queue = BinaryHeap::new();
-    loop {
-        let until = queue.peek().map(|(Reverse(t), _)| *t).unwrap_or(far_future);
-        tokio::select! {
-            m = event_expiration_receiver.recv() => {
-                match m {
-                    Some((t, n)) => {
-                        queue.push((Reverse(unix_to_instant(t)), n));
-                    }
-                    None => break,
-                }
-            }
-            _ = tokio::time::sleep_until(until) => {
-                delete_expired_events(&state, &mut queue);
-            }
-        }
-    }
-    let e = error::Error::Internal(anyhow::anyhow!("unexpected".to_string()).into());
-    Err(e)
-}
-
-fn delete_expired_events(state: &AppState, queue: &mut BinaryHeap<(Reverse<Instant>, u64)>) {
-    let now = Instant::now();
-    let mut db = state.db.write();
-    while let Some((Reverse(t), _)) = queue.peek() {
-        if *t > now {
-            break;
-        }
-        let (_, n) = queue.pop().unwrap();
-        db.remove_event(n);
-    }
-}
-
-fn unix_to_instant(t: u64) -> Instant {
-    let epoch = Instant::now() - SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    epoch + Duration::from_secs(t)
-}
-
-// copied from https://github.com/tokio-rs/tokio/blob/c8f3539bc11e57843745c68ee60ca5276248f9f9/tokio/src/time/instant.rs#L57
-fn far_future() -> Instant {
-    // Roughly 30 years from now.
-    // API does not provide a way to obtain max `Instant`
-    // or convert specific date in the future to instant.
-    // 1000 years overflows on macOS, 100 years overflows on FreeBSD.
-    Instant::now() + Duration::from_secs(86400 * 365 * 30)
 }
