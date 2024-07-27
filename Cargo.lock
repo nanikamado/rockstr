@@ -841,6 +841,7 @@ dependencies = [
  "log",
  "parking_lot",
  "qp-trie",
+ "rand",
  "rustc-hash",
  "secp256k1",
  "serde",

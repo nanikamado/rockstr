@@ -2,7 +2,6 @@ use crate::nostr::{Condition, Event, EventId, Filter, FirstTagValue, PubKey, Sin
 use crate::priority_queue::PriorityQueue;
 use qp_trie::Trie;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::io;
@@ -197,25 +196,29 @@ impl Db {
     }
 }
 
+type ConditionVec = Vec<u8>;
+
 #[derive(Debug)]
-struct ConditionsWithLatest<'a> {
-    or_conditions: PriorityQueue<Time, &'a Condition>,
-    remained: Vec<&'a Condition>,
+struct ConditionsWithLatest {
+    or_conditions: PriorityQueue<Time, ConditionVec>,
+    remained: Vec<ConditionVec>,
 }
 
-impl<'a> ConditionsWithLatest<'a> {
-    fn new(conditions: Vec<&'a Condition>) -> Self {
+impl ConditionsWithLatest {
+    fn new(conditions: Vec<&Condition>) -> Self {
         ConditionsWithLatest {
             or_conditions: PriorityQueue::new(),
-            remained: conditions,
+            remained: conditions
+                .into_iter()
+                .map(|condition| condition.to_vec())
+                .collect(),
         }
     }
 
     fn next(&mut self, db: &Db, until: Time) -> Option<Time> {
         while let Some(c) = self.remained.pop() {
-            if let Some((s, _)) = db.conditions.iter_prefix(&Cow::Borrowed(c).to_vec()).next() {
-                let l = c.byte_len();
-                let t = Time::from_slice(&s[l..]);
+            if let Some((s, _)) = db.conditions.iter_prefix(&c).next() {
+                let t = Time::from_slice(&s[c.len()..]);
                 if t <= until {
                     self.or_conditions.push(t, c);
                 }
@@ -269,13 +272,13 @@ impl Time {
 }
 
 #[derive(Debug)]
-pub struct GetEvents<'a> {
+pub struct GetEvents {
     until: Time,
-    and_conditions: PriorityQueue<u64, ConditionsWithLatest<'a>>,
+    and_conditions: PriorityQueue<u64, ConditionsWithLatest>,
 }
 
-impl<'a> GetEvents<'a> {
-    pub fn new(filter: &'a Filter) -> Option<Self> {
+impl GetEvents {
+    pub fn new(filter: &Filter) -> Option<Self> {
         if filter.search.is_some() {
             return None;
         }

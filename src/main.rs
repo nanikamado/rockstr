@@ -17,6 +17,7 @@ use error::Error;
 use log::{debug, info, trace, warn};
 use nostr::{ClientToRelay, Event, FirstTagValue, PubKey, Tag};
 use parking_lot::RwLock;
+use rand::RngCore;
 use relay::{AddEventError, Db, GetEvents, Time};
 use rustc_hash::FxHashMap;
 use serde_json::json;
@@ -80,10 +81,13 @@ pub async fn root(
             })
             .on_upgrade(|ws| async {
                 let receiver = state.broadcast_sender.subscribe();
+                let mut challenge = [0u8; 16];
+                rand::thread_rng().fill_bytes(&mut challenge);
                 let mut cs = ConnectionState {
                     ws,
                     broadcast_receiver: receiver,
                     req: FxHashMap::default(),
+                    challenge: hex::encode(challenge),
                 };
                 let _ = ws_handler(state, &mut cs).await;
                 let _ = cs.ws.close().await;
@@ -117,9 +121,16 @@ struct ConnectionState {
     ws: WebSocket,
     broadcast_receiver: tokio::sync::broadcast::Receiver<Arc<Event>>,
     req: FxHashMap<String, SmallVec<[Filter; 2]>>,
+    challenge: String,
 }
 
 async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<CloseReason, Error> {
+    cs.ws
+        .send(ws::Message::Text(format!(
+            r#"["AUTH", "{}"]"#,
+            cs.challenge
+        )))
+        .await?;
     let mut waiting_for_pong = false;
     let r = loop {
         tokio::select! {
@@ -206,21 +217,22 @@ async fn handle_message(
                     ClientToRelay::Req { id, filters } => {
                         debug!("req with {s}");
                         for f in &filters {
-                            if let Some(mut s) = GetEvents::new(f) {
-                                for _ in 0..f.limit {
-                                    let m = {
-                                        let db = state.db.read();
-                                        let Some(Time(t, n)) = s.next(&db) else {
-                                            break;
-                                        };
-                                        if t < f.since {
-                                            break;
-                                        }
-                                        let e = db.n_to_event.get(&n).unwrap();
-                                        Message::Text(event_message(&id, e))
+                            let Some(mut s) = GetEvents::new(f) else {
+                                continue;
+                            };
+                            for _ in 0..f.limit {
+                                let m = {
+                                    let db = state.db.read();
+                                    let Some(Time(t, n)) = s.next(&db) else {
+                                        break;
                                     };
-                                    cs.ws.send(m).await?;
-                                }
+                                    if t < f.since {
+                                        break;
+                                    }
+                                    let e = db.n_to_event.get(&n).unwrap();
+                                    Message::Text(event_message(&id, e))
+                                };
+                                cs.ws.send(m).await?;
                             }
                         }
                         cs.ws
@@ -276,6 +288,8 @@ async fn handle_event(
             (false, "deleted: user requested deletion")
         } else if event.created_at > now + CREATED_AT_UPPER_LIMIT {
             (false, "invalid: created_at too early")
+        } else if event.kind == 22242 {
+            (true, "")
         } else if (20_000..30_000).contains(&event.kind) {
             let _ = state.broadcast_sender.send(event);
             (true, "")
