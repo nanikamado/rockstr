@@ -30,6 +30,9 @@ use std::sync::{Arc, LazyLock as Lazy};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BIND_ADDRESS: &str = "127.0.0.1:8017";
+static TRUSTED_PUBKEY: Lazy<PubKey> = Lazy::new(|| {
+    PubKey::from_str("dbf6f6efae0173423554cab58709c0744be59d644dc18ac67351aa5342455450").unwrap()
+});
 
 #[derive(Debug)]
 pub struct AppState {
@@ -87,6 +90,7 @@ pub async fn root(
                     broadcast_receiver: receiver,
                     req: FxHashMap::default(),
                     challenge: hex::encode(challenge),
+                    authed_pubkey: None,
                 };
                 let _ = ws_handler(state, &mut cs).await;
                 let _ = cs.ws.close().await;
@@ -121,6 +125,7 @@ struct ConnectionState {
     broadcast_receiver: tokio::sync::broadcast::Receiver<Arc<Event>>,
     req: FxHashMap<String, SmallVec<[Filter; 2]>>,
     challenge: String,
+    authed_pubkey: Option<PubKey>,
 }
 
 async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<CloseReason, Error> {
@@ -183,16 +188,21 @@ fn event_message(id: &str, e: &Event) -> String {
     format!(r#"["EVENT",{},{}]"#, AsJson(&id), AsJson(e))
 }
 
-fn expiration_time(e: &Event) -> Option<u64> {
-    e.tags.iter().find_map(|Tag(k, v)| {
-        if k != "expiration" {
-            return None;
+fn important_tags(e: &Event) -> (Option<u64>, bool) {
+    let mut expiration = None;
+    let mut protected = false;
+    for Tag(k, v) in &e.tags {
+        if k == "expiration" {
+            if let Some((FirstTagValue::String(t), _)) = &v {
+                if let Ok(n) = t.parse::<u64>() {
+                    expiration = Some(n);
+                }
+            }
+        } else if k == "-" {
+            protected = true;
         }
-        match &v.as_ref()?.0 {
-            FirstTagValue::Hex32(_) => None,
-            FirstTagValue::String(t) => t.parse::<u64>().ok(),
-        }
-    })
+    }
+    (expiration, protected)
 }
 
 async fn handle_message(
@@ -210,7 +220,11 @@ async fn handle_message(
                     .as_secs();
                 match m {
                     ClientToRelay::Event(e) => {
-                        handle_event(state, cs, e, s.len(), now).await?;
+                        handle_event(state, cs, e, s.len(), now, false).await?;
+                        None
+                    }
+                    ClientToRelay::Auth(e) => {
+                        handle_event(state, cs, e, s.len(), now, true).await?;
                         None
                     }
                     ClientToRelay::Req { id, filters } => {
@@ -301,6 +315,7 @@ async fn handle_event(
     event: Arc<Event>,
     event_len: usize,
     now: u64,
+    is_auth: bool,
 ) -> Result<(), Error> {
     use axum::extract::ws::Message;
     let id = event.id;
@@ -319,15 +334,25 @@ async fn handle_event(
             (false, "deleted: user requested deletion")
         } else if event.created_at > now + CREATED_AT_UPPER_LIMIT {
             (false, "invalid: created_at too early")
-        } else if event.kind == 22242 {
-            (true, "")
+        } else if is_auth {
+            if event.kind == 22_242 && verify_auth(cs, &event, now) {
+                cs.authed_pubkey = Some(event.pubkey);
+                (true, "")
+            } else {
+                (false, "invalid: bad auth")
+            }
         } else if (20_000..30_000).contains(&event.kind) {
             let _ = state.broadcast_sender.send(event);
             (true, "")
         } else {
-            let ex = expiration_time(&event);
+            let (ex, protected) = important_tags(&event);
             if ex.map_or(false, |e| e <= now) {
                 (false, "invalid: event expired")
+            } else if protected
+                && cs.authed_pubkey != Some(event.pubkey)
+                && cs.authed_pubkey != Some(*TRUSTED_PUBKEY)
+            {
+                (false, "blocked: event marked as protected")
             } else {
                 match db.add_event(event.clone()) {
                     Ok(n) => {
@@ -357,6 +382,25 @@ async fn handle_event(
         state.event_expiration_sender.send(e).await.unwrap();
     }
     Ok(())
+}
+
+fn verify_auth(cs: &ConnectionState, event: &Event, now: u64) -> bool {
+    let mut relay = false;
+    let mut challenge = false;
+    for Tag(k, v) in &event.tags {
+        if let Some((FirstTagValue::String(v), _)) = v {
+            match k.as_str() {
+                "relay" => {
+                    relay = v.starts_with("wss://rockstr.momostr.pink");
+                }
+                "challenge" => {
+                    challenge = *v == cs.challenge;
+                }
+                _ => (),
+            }
+        }
+    }
+    relay && challenge && event.created_at.abs_diff(now) < 600
 }
 
 async fn handler_404(uri: axum::http::Uri) -> Error {

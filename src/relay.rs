@@ -524,14 +524,6 @@ impl<'a> GetEvents<'a> {
         let mut next_and_conditions = PriorityQueue::with_capacity(self.and_conditions.len());
         let mut count = 0.;
         loop {
-            let mut hs = vec![(
-                100,
-                self.until.0,
-                100,
-                100,
-                OrderedFloat(100.0),
-                OrderedFloat(100.0),
-            )];
             while let Some((p_diff, mut cs)) = self.and_conditions.pop() {
                 if head_conditions.contains(&cs.id) {
                     next_and_conditions.push(p_diff, cs);
@@ -549,7 +541,6 @@ impl<'a> GetEvents<'a> {
                             (OrderedFloat(diff.0 as f32 / number_of_db_access.min(1) as f32)
                                 + (p_diff * count))
                                 / (count + 1.);
-                        hs.push((cs.id, t.0, diff.0, number_of_db_access, p_diff, priority));
                         next_and_conditions.push(priority, cs);
                     }
                 } else {

@@ -1,3 +1,4 @@
+use bitcoin_hashes::hex::DisplayHex;
 use bitcoin_hashes::{sha256, Hash};
 use secp256k1::schnorr::Signature;
 use secp256k1::{Message, XOnlyPublicKey};
@@ -148,6 +149,19 @@ pub enum FirstTagValue {
     #[serde(with = "hex::serde")]
     Hex32([u8; 32]),
     String(String),
+}
+
+impl Display for FirstTagValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FirstTagValue::Hex32(a) => {
+                write!(f, "{}", a.as_hex())
+            }
+            FirstTagValue::String(a) => {
+                write!(f, "{a}")
+            }
+        }
+    }
 }
 
 #[test]
@@ -402,6 +416,8 @@ pub enum ClientToRelayTag {
     Req,
     #[serde(rename = "CLOSE")]
     Close,
+    #[serde(rename = "AUTH")]
+    Auth,
 }
 
 #[derive(Debug)]
@@ -413,6 +429,7 @@ pub enum ClientToRelay<'a> {
     },
     #[allow(unused)]
     Close(Cow<'a, str>),
+    Auth(Arc<Event>),
 }
 
 impl<'a> Deserialize<'a> for ClientToRelay<'a> {
@@ -446,6 +463,12 @@ impl<'a> Visitor<'a> for ClientToRelayVisitor {
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
                 Ok(ClientToRelay::Event(e))
+            }
+            ClientToRelayTag::Auth => {
+                let e = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                Ok(ClientToRelay::Auth(e))
             }
             ClientToRelayTag::Req => {
                 let id = seq
