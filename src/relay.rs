@@ -1,5 +1,7 @@
 use crate::nostr::{Condition, Event, EventId, Filter, FirstTagValue, PubKey, SingleLetterTags};
 use crate::priority_queue::PriorityQueue;
+use bitcoin_hashes::hex::DisplayHex;
+use ordered_float::OrderedFloat;
 use rocksdb::{DBIteratorWithThreadMode as RocksIter, IteratorMode, DB as Rocks};
 use rustc_hash::FxHashSet;
 use std::fmt::Debug;
@@ -67,7 +69,7 @@ fn prefix_iterator<'a>(
     db: &'a Rocks,
     prefix: &'a [u8],
 ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a {
-    db.iterator(IteratorMode::From(&prefix, rocksdb::Direction::Forward))
+    db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
         .map(|a| a.unwrap())
         .take_while(|(a, _)| a.starts_with(prefix))
 }
@@ -106,7 +108,7 @@ impl Db {
     }
 
     pub fn deleted_insert(&self, id: &EventId) {
-        self.deleted.delete(id.as_byte_array()).unwrap()
+        self.deleted.put(id.as_byte_array(), []).unwrap()
     }
 
     pub fn contains(&self, id: EventId) -> bool {
@@ -137,8 +139,14 @@ impl Db {
                     let mut i = GetEvents {
                         until: Time(u64::MAX, u64::MAX),
                         and_conditions: PriorityQueue::from([
-                            (u64::MAX, ConditionsWithLatest::new(vec![&author], self)),
-                            (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind], self)),
+                            (
+                                OrderedFloat(100.),
+                                ConditionsWithLatest::new(vec![&author], self, 0),
+                            ),
+                            (
+                                OrderedFloat(0.),
+                                ConditionsWithLatest::new(vec![&kind], self, 1),
+                            ),
                         ]),
                     };
                     if let Some(Time(t, n)) = i.next(self) {
@@ -180,9 +188,18 @@ impl Db {
                         let mut i = GetEvents {
                             until: Time(u64::MAX, u64::MAX),
                             and_conditions: PriorityQueue::from([
-                                (u64::MAX, ConditionsWithLatest::new(vec![&author], self)),
-                                (u64::MAX - 1, ConditionsWithLatest::new(vec![&kind], self)),
-                                (u64::MAX - 1, ConditionsWithLatest::new(vec![&d_tag], self)),
+                                (
+                                    OrderedFloat(200.),
+                                    ConditionsWithLatest::new(vec![&d_tag], self, 2),
+                                ),
+                                (
+                                    OrderedFloat(100.),
+                                    ConditionsWithLatest::new(vec![&author], self, 0),
+                                ),
+                                (
+                                    OrderedFloat(0.),
+                                    ConditionsWithLatest::new(vec![&kind], self, 1),
+                                ),
                             ]),
                         };
                         while let Some(Time(t, n)) = i.next(self) {
@@ -263,26 +280,26 @@ impl Db {
         self.n_to_event_remove(n);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
             self.conditions
-                .delete(&key_to_vec(
+                .delete(key_to_vec(
                     &Condition::Tag(tag, value.clone()),
                     Time(event.created_at, n),
                 ))
                 .unwrap();
         }
         self.conditions
-            .delete(&key_to_vec(
+            .delete(key_to_vec(
                 &Condition::Author(event.pubkey),
                 Time(event.created_at, n),
             ))
             .unwrap();
         self.conditions
-            .delete(&key_to_vec(
+            .delete(key_to_vec(
                 &Condition::Id(event.id),
                 Time(event.created_at, n),
             ))
             .unwrap();
         self.conditions
-            .delete(&key_to_vec(
+            .delete(key_to_vec(
                 &Condition::Kind(event.kind),
                 Time(event.created_at, n),
             ))
@@ -300,7 +317,7 @@ struct ConditionAndIter<'a> {
 
 impl Debug for ConditionAndIter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Debug::fmt(&self.condition, f)
+        write!(f, "{}", self.condition.as_hex())
     }
 }
 
@@ -308,29 +325,41 @@ impl Debug for ConditionAndIter<'_> {
 pub struct ConditionsWithLatest<'a> {
     or_conditions: PriorityQueue<Time, ConditionAndIter<'a>>,
     remained: Vec<ConditionAndIter<'a>>,
+    id: u32,
 }
 
 #[derive(Debug)]
 pub struct ConditionsWithLatestStopped {
     or_conditions: Vec<(Time, ConditionVec)>,
     remained: Vec<ConditionVec>,
+    id: u32,
 }
 
 impl<'a> ConditionsWithLatest<'a> {
-    fn new(conditions: Vec<&Condition>, db: &'a Db) -> Self {
+    fn new(conditions: Vec<&Condition>, db: &'a Db, id: u32) -> Self {
         ConditionsWithLatest {
             or_conditions: PriorityQueue::new(),
             remained: conditions
                 .into_iter()
                 .map(|condition| ConditionAndIter {
                     condition: condition.to_vec(),
-                    db: db.conditions.iterator(IteratorMode::Start),
+                    db: db.conditions.iterator(IteratorMode::End),
                 })
                 .collect(),
+            id,
         }
     }
 
-    fn next(&mut self, until: Time) -> Option<Time> {
+    fn get_latest(&mut self, until: Time) -> Option<(u32, Time)> {
+        while let Some((t, _)) = self.or_conditions.peek() {
+            if *t > until {
+                let c = self.or_conditions.pop().unwrap().1;
+                self.remained.push(c);
+            } else {
+                break;
+            }
+        }
+        let number_of_db_access = self.remained.len() as u32;
         while let Some(ConditionAndIter {
             condition: mut c,
             db: mut i,
@@ -339,9 +368,6 @@ impl<'a> ConditionsWithLatest<'a> {
             let c_len = c.len();
             until.write_bytes(&mut c).unwrap();
             i.set_mode(rocksdb::IteratorMode::From(&c, rocksdb::Direction::Reverse));
-            // let mut i = db
-            //     .conditions
-            //     .iterator(rocksdb::IteratorMode::From(&c, rocksdb::Direction::Reverse));
             c.truncate(c_len);
             if let Some(a) = i.next() {
                 let s = a.unwrap().0;
@@ -357,9 +383,8 @@ impl<'a> ConditionsWithLatest<'a> {
                 }
             }
         }
-        if let Some((t, c)) = self.or_conditions.pop() {
-            self.remained.push(c);
-            Some(t)
+        if let Some((t, _)) = self.or_conditions.peek() {
+            Some((number_of_db_access, *t))
         } else {
             None
         }
@@ -373,6 +398,7 @@ impl<'a> ConditionsWithLatest<'a> {
                 .map(|(p, c)| (p, c.condition))
                 .collect(),
             remained: self.remained.into_iter().map(|c| c.condition).collect(),
+            id: self.id,
         }
     }
 }
@@ -388,7 +414,7 @@ impl ConditionsWithLatestStopped {
                         p,
                         ConditionAndIter {
                             condition,
-                            db: db.conditions.iterator(IteratorMode::Start),
+                            db: db.conditions.iterator(IteratorMode::End),
                         },
                     )
                 })
@@ -398,9 +424,10 @@ impl ConditionsWithLatestStopped {
                 .into_iter()
                 .map(|condition| ConditionAndIter {
                     condition,
-                    db: db.conditions.iterator(IteratorMode::Start),
+                    db: db.conditions.iterator(IteratorMode::End),
                 })
                 .collect(),
+            id: self.id,
         }
     }
 }
@@ -452,7 +479,7 @@ impl Time {
 #[derive(Debug)]
 pub struct GetEvents<'a> {
     pub until: Time,
-    pub and_conditions: PriorityQueue<u64, ConditionsWithLatest<'a>>,
+    pub and_conditions: PriorityQueue<OrderedFloat<f32>, ConditionsWithLatest<'a>>,
 }
 
 impl<'a> GetEvents<'a> {
@@ -461,13 +488,13 @@ impl<'a> GetEvents<'a> {
             return None;
         }
         let mut and_conditions = PriorityQueue::with_capacity(filter.conditions.len());
-        for (priority, cs) in &filter.conditions {
+        for (i, (priority, cs)) in filter.conditions.iter().enumerate() {
             if cs.is_empty() {
                 return None;
             }
             and_conditions.push(
-                *priority,
-                ConditionsWithLatest::new(cs.iter().collect(), db),
+                OrderedFloat(*priority),
+                ConditionsWithLatest::new(cs.iter().collect(), db, i as u32),
             );
         }
         Some(GetEvents {
@@ -493,34 +520,50 @@ impl<'a> GetEvents<'a> {
                 None
             };
         }
+        let mut head_conditions = Vec::new();
+        let mut next_and_conditions = PriorityQueue::with_capacity(self.and_conditions.len());
+        let mut count = 0.;
         loop {
-            let mut next_and_conditions = PriorityQueue::with_capacity(self.and_conditions.len());
-            let mut first = true;
-            let mut all = true;
+            let mut hs = vec![(
+                100,
+                self.until.0,
+                100,
+                100,
+                OrderedFloat(100.0),
+                OrderedFloat(100.0),
+            )];
             while let Some((p_diff, mut cs)) = self.and_conditions.pop() {
-                if let Some(t) = cs.next(self.until) {
+                if head_conditions.contains(&cs.id) {
+                    next_and_conditions.push(p_diff, cs);
+                } else if let Some((number_of_db_access, t)) = cs.get_latest(self.until) {
                     let diff = self.until.minus(t);
                     self.until = t;
-                    if first {
-                        first = false;
-                    } else if diff != (0, 0) {
-                        all = false;
+                    if diff != (0, 0) {
+                        head_conditions.clear();
                     }
-                    let c_len = (cs.or_conditions.len() + cs.remained.len()) as u64;
-                    if c_len == 0 {
-                        return None;
+                    head_conditions.push(cs.id);
+                    if count == 0. {
+                        next_and_conditions.push(p_diff, cs);
+                    } else {
+                        let priority =
+                            (OrderedFloat(diff.0 as f32 / number_of_db_access.min(1) as f32)
+                                + (p_diff * count))
+                                / (count + 1.);
+                        hs.push((cs.id, t.0, diff.0, number_of_db_access, p_diff, priority));
+                        next_and_conditions.push(priority, cs);
                     }
-                    next_and_conditions.push(diff.0 / (c_len * 2) + p_diff / 2, cs);
                 } else {
                     return None;
                 }
             }
-            self.and_conditions = next_and_conditions;
-            if all {
+            std::mem::swap(&mut self.and_conditions, &mut next_and_conditions);
+            next_and_conditions.clear();
+            if head_conditions.len() == self.and_conditions.len() {
                 let c = self.until;
                 self.until = c.pred();
                 return Some(c);
             }
+            count += 1.0;
         }
     }
 
@@ -538,11 +581,11 @@ impl<'a> GetEvents<'a> {
 
 pub struct GetEventsStopped {
     pub until: Time,
-    pub and_conditions: Vec<(u64, ConditionsWithLatestStopped)>,
+    pub and_conditions: Vec<(OrderedFloat<f32>, ConditionsWithLatestStopped)>,
 }
 
 impl GetEventsStopped {
-    pub fn restart<'a>(self, db: &'a Db) -> GetEvents<'a> {
+    pub fn restart(self, db: &Db) -> GetEvents {
         GetEvents {
             until: self.until,
             and_conditions: self

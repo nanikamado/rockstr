@@ -192,7 +192,7 @@ impl Event {
     }
 }
 
-type Priority = u64;
+type Priority = f32;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Filter {
@@ -243,7 +243,7 @@ impl<'a> Iterator for SingleLetterTags<'a> {
         for Tag(t1, t2) in self.0.by_ref() {
             if t1.len() == 1 {
                 let key = t1.as_bytes()[0];
-                if (b'a'..b'z').contains(&key) || (b'A'..b'Z').contains(&key) {
+                if key.is_ascii_alphabetic() {
                     if let Some((value, _)) = t2 {
                         return Some((key, value));
                     }
@@ -347,7 +347,7 @@ where
                             .into_iter()
                             .map(Condition::Author)
                             .collect();
-                        tags.push((u64::MAX - 3, s))
+                        tags.push((700., s))
                     }
                     "kinds" => {
                         let s = map
@@ -355,7 +355,7 @@ where
                             .into_iter()
                             .map(Condition::Kind)
                             .collect();
-                        tags.push((u64::MAX - 5, s))
+                        tags.push((0., s))
                     }
                     "ids" => {
                         let s = map
@@ -363,7 +363,7 @@ where
                             .into_iter()
                             .map(Condition::Id)
                             .collect();
-                        tags.push((u64::MAX, s))
+                        tags.push((1000., s))
                     }
                     _ => {
                         if key.len() == 2 && key.starts_with('#') {
@@ -374,11 +374,11 @@ where
                                 .map(|v| Condition::Tag(t, v))
                                 .collect();
                             let priority = if t == b'e' {
-                                u64::MAX - 1
+                                900.
                             } else if t == b'p' {
-                                u64::MAX - 2
+                                800.
                             } else {
-                                u64::MAX - 4
+                                600.
                             };
                             tags.push((priority, s));
                         } else {

@@ -43,6 +43,10 @@ impl<K: Ord, V> PriorityQueue<K, V> {
         self.0.pop().map(|HeapValue(k, v)| (k, v))
     }
 
+    pub fn peek(&self) -> Option<(&K, &V)> {
+        self.0.peek().map(|HeapValue(k, v)| (k, v))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -57,6 +61,10 @@ impl<K: Ord, V> PriorityQueue<K, V> {
 
     pub fn into_iter(self) -> impl Iterator<Item = (K, V)> {
         self.0.into_iter().map(|HeapValue(k, v)| (k, v))
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear()
     }
 }
 
