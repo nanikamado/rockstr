@@ -47,6 +47,10 @@ impl EventId {
     pub fn as_byte_array(&self) -> &[u8; 32] {
         self.0.as_byte_array()
     }
+
+    pub fn to_byte_array(self) -> [u8; 32] {
+        self.0.to_byte_array()
+    }
 }
 
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
@@ -68,6 +72,16 @@ impl std::str::FromStr for PubKey {
     type Err = secp256k1::Error;
     fn from_str(s: &str) -> Result<PubKey, Self::Err> {
         Ok(PubKey(XOnlyPublicKey::from_str(s)?))
+    }
+}
+
+impl PubKey {
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.serialize()
+    }
+
+    pub fn from_slice(s: &[u8]) -> Result<Self, secp256k1::Error> {
+        Ok(PubKey(XOnlyPublicKey::from_slice(s)?))
     }
 }
 
@@ -274,6 +288,7 @@ pub enum Condition {
     Author(PubKey),
     Kind(u32),
     Id(EventId),
+    Deleted(EventId),
 }
 
 impl Condition {
@@ -281,12 +296,12 @@ impl Condition {
         match self {
             Condition::Id(a) => {
                 buff.push(0);
-                buff.write_all(a.0.as_byte_array())?;
+                buff.write_all(a.as_byte_array())?;
                 buff.push(0);
             }
             Condition::Author(a) => {
                 buff.push(0);
-                buff.write_all(&a.0.serialize())?;
+                buff.write_all(&a.to_bytes())?;
                 buff.push(1);
             }
             Condition::Tag(c, FirstTagValue::Hex32(a)) => {
@@ -302,20 +317,16 @@ impl Condition {
             Condition::Kind(k) => {
                 buff.push(1);
                 buff.write_all(&k.to_be_bytes())?;
+                // TODO: remove
                 buff.push(0xff);
+            }
+            Condition::Deleted(a) => {
+                buff.push(0);
+                buff.write_all(a.as_byte_array())?;
+                buff.push(2);
             }
         }
         Ok(())
-    }
-
-    pub fn byte_len(&self) -> usize {
-        match self {
-            Condition::Id(_)
-            | Condition::Author(_)
-            | Condition::Tag(_, FirstTagValue::Hex32(_)) => 34,
-            Condition::Tag(_, FirstTagValue::String(a)) => a.len() + 2,
-            Condition::Kind(_) => 6,
-        }
     }
 
     pub fn to_vec(&self) -> Vec<u8> {

@@ -256,16 +256,14 @@ async fn handle_message(
                                             break St::End;
                                         }
                                         limit -= 1;
-                                        let m = {
-                                            let Some(Time(t, n)) = s.next(&db) else {
-                                                break St::End;
-                                            };
-                                            if t < f.since {
-                                                break St::End;
-                                            }
-                                            let e = db.n_to_event_get(n).unwrap();
-                                            Message::Text(event_message(&id, &e))
+                                        let Some(Time(t, n)) = s.next(&db) else {
+                                            break St::End;
                                         };
+                                        if t < f.since {
+                                            break St::End;
+                                        }
+                                        let e = db.n_to_event_get(n).unwrap();
+                                        let m = Message::Text(event_message(&id, &e));
                                         ms.push(m);
                                         if ms.len() >= 100 {
                                             break St::Middle(s.stop());
@@ -330,8 +328,6 @@ async fn handle_event(
             (false, "invalid: bad event id")
         } else if !event.verify_sig() {
             (false, "invalid: bad signature")
-        } else if db.is_deleted(&id) {
-            (false, "deleted: user requested deletion")
         } else if event.created_at > now + CREATED_AT_UPPER_LIMIT {
             (false, "invalid: created_at too early")
         } else if is_auth {
@@ -344,6 +340,11 @@ async fn handle_event(
         } else if (20_000..30_000).contains(&event.kind) {
             let _ = state.broadcast_sender.send(event);
             (true, "")
+        } else if let Err(e) = db.check_event_id(&event.pubkey, &id) {
+            match e {
+                relay::EventIdError::Duplicated => (true, "duplicate: already have this event"),
+                relay::EventIdError::Deleted => (false, "deleted: user requested deletion"),
+            }
         } else {
             let (ex, protected) = important_tags(&event);
             if ex.map_or(false, |e| e <= now) {
@@ -357,17 +358,11 @@ async fn handle_event(
                 match db.add_event(event.clone()) {
                     Ok(n) => {
                         let _ = state.broadcast_sender.send(event);
-                        // if db.n_to_event.len() >= 100_000 {
-                        //     let oldest = db.time.first().unwrap().1;
-                        //     trace!("remove {oldest}");
-                        //     db.remove_event(oldest);
-                        // }
                         if let Some(e) = ex {
                             expiration = Some(Time(e, n));
                         }
                         (true, "")
                     }
-                    Err(AddEventError::Duplicated) => (true, "duplicate: already have this event"),
                     Err(AddEventError::HaveNewer) => (true, "duplicate: have a newer event"),
                 }
             }

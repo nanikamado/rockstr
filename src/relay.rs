@@ -15,14 +15,13 @@ type UnixTime = u64;
 #[derive(Debug)]
 pub struct Db {
     pub next_n: u64,
-    // u64 -> event json
+    /// [u64] -> event json
     pub n_to_event: Rocks,
-    // condition time -> []
+    /// [Condition] [Time] -> []
+    /// | [Condition::Deleted] -> [PubKey]
     pub conditions: Rocks,
-    // time -> []
+    /// [Time] -> []
     pub time: Rocks,
-    // event id -> []
-    pub deleted: Rocks,
     pub blocked_pubkeys: FxHashSet<PubKey>,
 }
 
@@ -35,7 +34,6 @@ impl Default for Db {
         let conditions = Rocks::open(&opts, config_dir.join("conditions.rocksdb")).unwrap();
         let n_to_event = Rocks::open(&opts, config_dir.join("n_to_event.rocksdb")).unwrap();
         let time = Rocks::open(&opts, config_dir.join("time.rocksdb")).unwrap();
-        let deleted = Rocks::open(&opts, config_dir.join("deleted.rocksdb")).unwrap();
         let next_n = if let Some(a) = n_to_event.iterator(rocksdb::IteratorMode::End).next() {
             u64::from_be_bytes(a.unwrap().0.as_ref().try_into().unwrap()) + 1
         } else {
@@ -46,7 +44,6 @@ impl Default for Db {
             n_to_event,
             conditions,
             time,
-            deleted,
             blocked_pubkeys: Default::default(),
         }
     }
@@ -54,7 +51,6 @@ impl Default for Db {
 
 #[derive(Debug, Clone, Copy)]
 pub enum AddEventError {
-    Duplicated,
     HaveNewer,
 }
 
@@ -72,6 +68,12 @@ fn prefix_iterator<'a>(
     db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
         .map(|a| a.unwrap())
         .take_while(|(a, _)| a.starts_with(prefix))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EventIdError {
+    Duplicated,
+    Deleted,
 }
 
 impl Db {
@@ -103,12 +105,34 @@ impl Db {
         self.time.put(time.to_vec(), []).unwrap();
     }
 
-    pub fn is_deleted(&self, id: &EventId) -> bool {
-        self.deleted.get(id.as_byte_array()).unwrap().is_some()
+    pub fn check_event_id(&self, pubkey: &PubKey, id: &EventId) -> Result<(), EventIdError> {
+        let mut prefix = Vec::with_capacity(33);
+        prefix.push(0);
+        use std::io::Write;
+        prefix.write_all(id.as_byte_array()).unwrap();
+        let mut i = prefix_iterator(&self.conditions, &prefix);
+        if let Some((_, v)) = i.next() {
+            if let Ok(a) = PubKey::from_slice(&v) {
+                if &a == pubkey {
+                    Err(EventIdError::Deleted)
+                } else {
+                    self.conditions
+                        .delete(&Condition::Deleted(*id).to_vec())
+                        .unwrap();
+                    Ok(())
+                }
+            } else {
+                Err(EventIdError::Duplicated)
+            }
+        } else {
+            Ok(())
+        }
     }
 
-    pub fn deleted_insert(&self, id: &EventId) {
-        self.deleted.put(id.as_byte_array(), []).unwrap()
+    pub fn deleted_insert(&self, pubkey: &PubKey, id: &EventId) {
+        self.conditions
+            .put(Condition::Deleted(*id).to_vec(), pubkey.to_bytes())
+            .unwrap();
     }
 
     pub fn contains(&self, id: EventId) -> bool {
@@ -127,14 +151,11 @@ impl Db {
     }
 
     pub fn add_event(&mut self, event: Arc<Event>) -> Result<u64, AddEventError> {
-        if self.contains(event.id) {
-            return Err(AddEventError::Duplicated);
-        }
         match event.kind {
             0 | 3 | 10000..20000 => {
                 let author = Condition::Author(event.pubkey);
                 let kind = Condition::Kind(event.kind);
-                let mut outdated = Vec::new();
+                let mut outdated = None;
                 {
                     let mut i = GetEvents {
                         until: Time(u64::MAX, u64::MAX),
@@ -161,11 +182,11 @@ impl Db {
                         if have_newer {
                             return Err(AddEventError::HaveNewer);
                         } else {
-                            outdated.push(n);
+                            outdated = Some(n);
                         }
                     }
                 }
-                for n in outdated {
+                if let Some(n) = outdated {
                     self.remove_event(n);
                 }
             }
@@ -183,7 +204,7 @@ impl Db {
                     let author = Condition::Author(event.pubkey);
                     let kind = Condition::Kind(event.kind);
                     let d_tag = Condition::Tag(b'd', d_value.clone());
-                    let mut outdated = Vec::new();
+                    let mut outdated = None;
                     {
                         let mut i = GetEvents {
                             until: Time(u64::MAX, u64::MAX),
@@ -213,13 +234,13 @@ impl Db {
                                 if have_newer {
                                     return Err(AddEventError::HaveNewer);
                                 } else {
-                                    outdated.push(n);
+                                    outdated = Some(n);
                                     break;
                                 }
                             }
                         }
                     }
-                    for n in outdated {
+                    if let Some(n) = outdated {
                         self.remove_event(n);
                     }
                 }
@@ -228,9 +249,18 @@ impl Db {
                 for t in &event.tags {
                     if let ("e", Some((FirstTagValue::Hex32(v), _))) = (t.0.as_ref(), &t.1) {
                         let e = EventId::from(*v);
-                        self.deleted_insert(&e);
+                        let mut is_valid = true;
                         if let Some(n) = self.id_to_n(e) {
-                            self.remove_event(n);
+                            if let Some(e) = self.n_to_event_get(n) {
+                                if event.pubkey == e.pubkey {
+                                    self.remove_event(n);
+                                } else {
+                                    is_valid = false;
+                                }
+                            }
+                        }
+                        if is_valid {
+                            self.deleted_insert(&event.pubkey, &e);
                         }
                     }
                 }
