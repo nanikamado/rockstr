@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::fs::create_dir_all;
 use std::io;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 type UnixTime = u64;
@@ -74,6 +75,16 @@ fn prefix_iterator<'a>(
 pub enum EventIdError {
     Duplicated,
     Deleted,
+}
+
+fn first_d_value(event: &Event) -> Option<&FirstTagValue> {
+    event.tags.iter().find_map(|t| {
+        if t.0 == "d" {
+            t.1.as_ref().map(|(a, _)| a)
+        } else {
+            None
+        }
+    })
 }
 
 impl Db {
@@ -191,58 +202,14 @@ impl Db {
                 }
             }
             30000..40000 => {
-                fn first_d_value(event: &Event) -> Option<&FirstTagValue> {
-                    event.tags.iter().find_map(|t| {
-                        if t.0 == "d" {
-                            t.1.as_ref().map(|(a, _)| a)
-                        } else {
-                            None
-                        }
-                    })
-                }
                 if let Some(d_value) = first_d_value(&event) {
-                    let author = Condition::Author(event.pubkey);
-                    let kind = Condition::Kind(event.kind);
-                    let d_tag = Condition::Tag(b'd', d_value.clone());
-                    let mut outdated = None;
-                    {
-                        let mut i = GetEvents {
-                            until: Time(u64::MAX, u64::MAX),
-                            and_conditions: PriorityQueue::from([
-                                (
-                                    OrderedFloat(200.),
-                                    ConditionsWithLatest::new(vec![&d_tag], self, 2),
-                                ),
-                                (
-                                    OrderedFloat(100.),
-                                    ConditionsWithLatest::new(vec![&author], self, 0),
-                                ),
-                                (
-                                    OrderedFloat(0.),
-                                    ConditionsWithLatest::new(vec![&kind], self, 1),
-                                ),
-                            ]),
-                        };
-                        while let Some(Time(t, n)) = i.next(self) {
-                            let e = self.n_to_event_get(n).unwrap();
-                            if first_d_value(&e).map_or(false, |d| d == d_value) {
-                                let have_newer = match t.cmp(&event.created_at) {
-                                    std::cmp::Ordering::Less => false,
-                                    std::cmp::Ordering::Equal => e.id > event.id,
-                                    std::cmp::Ordering::Greater => true,
-                                };
-                                if have_newer {
-                                    return Err(AddEventError::HaveNewer);
-                                } else {
-                                    outdated = Some(n);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(n) = outdated {
-                        self.remove_event(n);
-                    }
+                    self.remove_d_tagged_event(
+                        event.created_at,
+                        d_value,
+                        event.kind,
+                        event.pubkey,
+                        Some(&event.id),
+                    )?;
                 }
             }
             5 => {
@@ -263,44 +230,104 @@ impl Db {
                             self.deleted_insert(&event.pubkey, &e);
                         }
                     }
+                    if let ("a", Some((FirstTagValue::String(v), _))) = (t.0.as_ref(), &t.1) {
+                        if let Some(c1) = v.find(':') {
+                            if let Some(c2) = v[c1 + 1..].find(':') {
+                                let c2 = c1 + c2 + 1;
+                                let kind = &v[..c1];
+                                let pubkey = &v[c1 + 1..c2];
+                                let d_value = &FirstTagValue::parse(&v[c2 + 1..]);
+                                if let (Ok(kind), Ok(pubkey)) =
+                                    (kind.parse::<u32>(), PubKey::from_str(pubkey))
+                                {
+                                    let _ = self.remove_d_tagged_event(
+                                        event.created_at,
+                                        d_value,
+                                        kind,
+                                        pubkey,
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ => (),
         }
         let n = self.next_n;
         self.next_n = n + 1;
+        let time = Time(event.created_at, n);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
             self.conditions
-                .put(
-                    key_to_vec(
-                        &Condition::Tag(tag, value.clone()),
-                        Time(event.created_at, n),
-                    ),
-                    [],
-                )
+                .put(key_to_vec(&Condition::Tag(tag, value.clone()), time), [])
                 .unwrap();
         }
         self.conditions
-            .put(
-                key_to_vec(&Condition::Author(event.pubkey), Time(event.created_at, n)),
-                [],
-            )
+            .put(key_to_vec(&Condition::Author(event.pubkey), time), [])
             .unwrap();
         self.conditions
-            .put(
-                key_to_vec(&Condition::Id(event.id), Time(event.created_at, n)),
-                [],
-            )
+            .put(key_to_vec(&Condition::Id(event.id), time), [])
             .unwrap();
         self.conditions
-            .put(
-                key_to_vec(&Condition::Kind(event.kind), Time(event.created_at, n)),
-                [],
-            )
+            .put(key_to_vec(&Condition::Kind(event.kind), time), [])
             .unwrap();
-        self.time_insert(Time(event.created_at, n));
+        self.time_insert(time);
         self.n_to_event_insert(n, &event);
         Ok(n)
+    }
+
+    fn remove_d_tagged_event(
+        &mut self,
+        earlier_than: u64,
+        d_value: &FirstTagValue,
+        kind: u32,
+        author: PubKey,
+        id: Option<&EventId>,
+    ) -> Result<(), AddEventError> {
+        let author = Condition::Author(author);
+        let kind = Condition::Kind(kind);
+        let d_tag = Condition::Tag(b'd', d_value.clone());
+        let mut outdated = None;
+        {
+            let mut i = GetEvents {
+                until: Time(u64::MAX, u64::MAX),
+                and_conditions: PriorityQueue::from([
+                    (
+                        OrderedFloat(200.),
+                        ConditionsWithLatest::new(vec![&d_tag], self, 2),
+                    ),
+                    (
+                        OrderedFloat(100.),
+                        ConditionsWithLatest::new(vec![&author], self, 0),
+                    ),
+                    (
+                        OrderedFloat(0.),
+                        ConditionsWithLatest::new(vec![&kind], self, 1),
+                    ),
+                ]),
+            };
+            while let Some(Time(t, n)) = i.next(self) {
+                let e = self.n_to_event_get(n).unwrap();
+                if first_d_value(&e).map_or(false, |d| d == d_value) {
+                    let have_newer = match t.cmp(&earlier_than) {
+                        std::cmp::Ordering::Less => false,
+                        std::cmp::Ordering::Equal => id.map_or(false, |id| &e.id > id),
+                        std::cmp::Ordering::Greater => true,
+                    };
+                    if have_newer {
+                        return Err(AddEventError::HaveNewer);
+                    } else {
+                        outdated = Some(n);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(n) = outdated {
+            self.remove_event(n);
+        }
+        Ok(())
     }
 
     pub fn remove_event(&mut self, n: u64) {

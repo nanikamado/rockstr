@@ -178,6 +178,17 @@ impl Display for FirstTagValue {
     }
 }
 
+impl FirstTagValue {
+    pub fn parse(s: &str) -> Self {
+        let mut out = [0; 32];
+        if hex::decode_to_slice(s, &mut out).is_ok() {
+            FirstTagValue::Hex32(out)
+        } else {
+            FirstTagValue::String(s.to_string())
+        }
+    }
+}
+
 #[test]
 fn tag_value_serde_test() {
     let t: FirstTagValue = serde_json::from_str(r#""aa""#).unwrap();
