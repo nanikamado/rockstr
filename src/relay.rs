@@ -1,25 +1,68 @@
-use crate::nostr::{Condition, Event, EventId, Filter, FirstTagValue, PubKey, SingleLetterTags};
+use crate::nostr::{
+    ConditionCompact, Event, EventId, FilterCompact, FirstTagValue, FirstTagValueCompact, PubKey,
+    SingleLetterTags,
+};
 use crate::priority_queue::PriorityQueue;
 use bitcoin_hashes::hex::DisplayHex;
 use ordered_float::OrderedFloat;
 use rocksdb::{DBIteratorWithThreadMode as RocksIter, IteratorMode, DB as Rocks};
 use rustc_hash::FxHashSet;
+use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::fs::create_dir_all;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
 type UnixTime = u64;
 
+const HASH_TO_N_UNKNOWN: u8 = 2;
+const HASH_TO_N_HAVE: u8 = 1;
+const HASH_TO_N_DELETED: u8 = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum HashToNEntry {
+    Unknown { deletion_requested_by: Vec<u64> },
+    Have,
+    Deleted,
+}
+
+impl HashToNEntry {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        match bytes[8] {
+            HASH_TO_N_HAVE => HashToNEntry::Have,
+            HASH_TO_N_UNKNOWN => {
+                let deletion_requested_by = bytes[9..]
+                    .chunks(8)
+                    .map(|a| u64::from_be_bytes(a.try_into().unwrap()))
+                    .collect();
+                HashToNEntry::Unknown {
+                    deletion_requested_by,
+                }
+            }
+            HASH_TO_N_DELETED => HashToNEntry::Deleted,
+            _ => {
+                panic!()
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Db {
-    pub next_n: u64,
+    pub n_count: u64,
     /// [u64] -> event json
     pub n_to_event: Rocks,
-    /// [Condition] [Time] -> []
-    /// | [Condition::Deleted] -> [PubKey]
+    /// one of the following format:
+    /// - hash -> n as u64, 1 (if the hash is an id of event that we have)
+    /// - hash -> n as u64, 2 (if the hash is pubkey)
+    /// - hash -> n as u64, 2, \<n of the pubkey who requested the deletion as u64\>*
+    /// - hash -> n as u64, 3 (if the hash is requested to be deleted by its author)
+    hash_to_n: Rocks,
+    /// one of the following format:
+    /// - [ConditionCompact] [Time] -> []
+    /// - [ConditionCompact::Deleted] -> [PubKey]
     pub conditions: Rocks,
     /// [Time] -> []
     pub time: Rocks,
@@ -32,8 +75,10 @@ impl Default for Db {
         create_dir_all(config_dir).unwrap();
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         let conditions = Rocks::open(&opts, config_dir.join("conditions.rocksdb")).unwrap();
         let n_to_event = Rocks::open(&opts, config_dir.join("n_to_event.rocksdb")).unwrap();
+        let hash_to_n = Rocks::open(&opts, config_dir.join("hash_to_n.rocksdb")).unwrap();
         let time = Rocks::open(&opts, config_dir.join("time.rocksdb")).unwrap();
         let next_n = if let Some(a) = n_to_event.iterator(rocksdb::IteratorMode::End).next() {
             u64::from_be_bytes(a.unwrap().0.as_ref().try_into().unwrap()) + 1
@@ -41,8 +86,9 @@ impl Default for Db {
             1
         };
         Self {
-            next_n,
+            n_count: next_n,
             n_to_event,
+            hash_to_n,
             conditions,
             time,
             blocked_pubkeys: Default::default(),
@@ -53,28 +99,15 @@ impl Default for Db {
 #[derive(Debug, Clone, Copy)]
 pub enum AddEventError {
     HaveNewer,
+    Duplicated,
+    Deleted,
 }
 
-fn key_to_vec(condition: &Condition, time: Time) -> Vec<u8> {
+fn key_to_vec(condition: &ConditionCompact, time: Time) -> Vec<u8> {
     let mut buff = Vec::with_capacity(16);
     condition.write_bytes(&mut buff).unwrap();
     time.write_bytes(&mut buff).unwrap();
     buff
-}
-
-fn prefix_iterator<'a>(
-    db: &'a Rocks,
-    prefix: &'a [u8],
-) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a {
-    db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward))
-        .map(|a| a.unwrap())
-        .take_while(|(a, _)| a.starts_with(prefix))
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum EventIdError {
-    Duplicated,
-    Deleted,
 }
 
 fn first_d_value(event: &Event) -> Option<&FirstTagValue> {
@@ -116,56 +149,98 @@ impl Db {
         self.time.put(time.to_vec(), []).unwrap();
     }
 
-    pub fn check_event_id(&self, pubkey: &PubKey, id: &EventId) -> Result<(), EventIdError> {
-        let mut prefix = Vec::with_capacity(33);
-        prefix.push(0);
-        use std::io::Write;
-        prefix.write_all(id.as_byte_array()).unwrap();
-        let mut i = prefix_iterator(&self.conditions, &prefix);
-        if let Some((_, v)) = i.next() {
-            if let Ok(a) = PubKey::from_slice(&v) {
-                if &a == pubkey {
-                    Err(EventIdError::Deleted)
-                } else {
-                    self.conditions
-                        .delete(&Condition::Deleted(*id).to_vec())
-                        .unwrap();
-                    Ok(())
+    pub fn hash_to_n_get(&self, hash: &[u8; 32]) -> Option<(u64, HashToNEntry)> {
+        self.hash_to_n.get(hash).unwrap().map(|a| {
+            (
+                u64::from_be_bytes(a[..8].try_into().unwrap()),
+                HashToNEntry::from_bytes(&a),
+            )
+        })
+    }
+
+    pub fn hash_to_n_set_unknown(&self, hash: &[u8; 32], n: u64) {
+        let mut value = [0; 9];
+        value[..8].copy_from_slice(&n.to_be_bytes());
+        value[8] = HASH_TO_N_UNKNOWN;
+        self.hash_to_n.put(hash, value).unwrap();
+    }
+
+    pub fn hash_to_n_set_have(&self, hash: &[u8; 32], n: u64) {
+        let mut value = [0; 9];
+        value[..8].copy_from_slice(&n.to_be_bytes());
+        value[8] = HASH_TO_N_HAVE;
+        self.hash_to_n.put(hash, value).unwrap();
+    }
+
+    pub fn hash_to_n_set_deleted(&self, hash: &[u8; 32], n: u64) {
+        let mut value = [0; 9];
+        value[..8].copy_from_slice(&n.to_be_bytes());
+        value[8] = HASH_TO_N_DELETED;
+        self.hash_to_n.put(hash, value).unwrap();
+    }
+
+    pub fn hash_to_n_set_deletion_requested(&self, hash: &[u8; 32], n: u64, requested_by: &[u64]) {
+        let mut value = n.to_be_bytes().to_vec();
+        value.push(HASH_TO_N_UNKNOWN);
+        for r in requested_by {
+            value.write_all(&r.to_be_bytes()).unwrap();
+        }
+        self.hash_to_n.put(hash, value).unwrap();
+    }
+
+    pub fn get_n_from_event_id(&mut self, author: u64, id: &EventId) -> Result<u64, AddEventError> {
+        let id = id.as_byte_array();
+        let n = if let Some(v) = self.hash_to_n.get(id).unwrap() {
+            match HashToNEntry::from_bytes(&v) {
+                HashToNEntry::Have => return Err(AddEventError::Duplicated),
+                HashToNEntry::Unknown {
+                    deletion_requested_by,
+                } => {
+                    let n = u64::from_be_bytes(v[..8].try_into().unwrap());
+                    if deletion_requested_by.contains(&author) {
+                        self.hash_to_n_set_deleted(id, n);
+                        return Err(AddEventError::Deleted);
+                    }
+                    n
                 }
-            } else {
-                Err(EventIdError::Duplicated)
+                HashToNEntry::Deleted => return Err(AddEventError::Deleted),
             }
         } else {
-            Ok(())
+            // we do not know this id
+            self.n_count += 1;
+            self.n_count
+        };
+        self.hash_to_n_set_have(id, n);
+        Ok(n)
+    }
+
+    pub fn id_to_existing_n(&self, id: EventId) -> Option<u64> {
+        self.hash_to_n_get(id.as_byte_array()).and_then(|(n, s)| {
+            if s == HashToNEntry::Have {
+                Some(n)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn get_n_from_hash(&mut self, hash: &[u8; 32]) -> u64 {
+        if let Some(n) = self.hash_to_n.get(hash).unwrap() {
+            u64::from_be_bytes(n[..8].try_into().unwrap())
+        } else {
+            self.n_count += 1;
+            self.hash_to_n_set_unknown(hash, self.n_count);
+            self.n_count
         }
     }
 
-    pub fn deleted_insert(&self, pubkey: &PubKey, id: &EventId) {
-        self.conditions
-            .put(Condition::Deleted(*id).to_vec(), pubkey.to_bytes())
-            .unwrap();
-    }
-
-    pub fn contains(&self, id: EventId) -> bool {
-        let id = Condition::Id(id);
-        let p = id.to_vec();
-        let mut i = prefix_iterator(&self.conditions, &p);
-        i.next().is_some()
-    }
-
-    pub fn id_to_n(&self, id: EventId) -> Option<u64> {
-        let id = Condition::Id(id);
-        let p = id.to_vec();
-        let s = prefix_iterator(&self.conditions, &p).next()?.0;
-        let s = s[p.len() + 8..].try_into().unwrap();
-        Some(u64::from_be_bytes(s))
-    }
-
     pub fn add_event(&mut self, event: Arc<Event>) -> Result<u64, AddEventError> {
+        let author = self.get_n_from_hash(&event.pubkey.to_bytes());
+        let n = self.get_n_from_event_id(author, &event.id)?;
         match event.kind {
             0 | 3 | 10000..20000 => {
-                let author = Condition::Author(event.pubkey);
-                let kind = Condition::Kind(event.kind);
+                let author = ConditionCompact::Author(author);
+                let kind = ConditionCompact::Kind(event.kind);
                 let mut outdated = None;
                 {
                     let mut i = GetEvents {
@@ -173,11 +248,11 @@ impl Db {
                         and_conditions: PriorityQueue::from([
                             (
                                 OrderedFloat(100.),
-                                ConditionsWithLatest::new(vec![&author], self, 0),
+                                ConditionsWithLatest::new(vec![author], self, 0),
                             ),
                             (
                                 OrderedFloat(0.),
-                                ConditionsWithLatest::new(vec![&kind], self, 1),
+                                ConditionsWithLatest::new(vec![kind], self, 1),
                             ),
                         ]),
                     };
@@ -203,31 +278,49 @@ impl Db {
             }
             30000..40000 => {
                 if let Some(d_value) = first_d_value(&event) {
+                    let pubkey = self.get_n_from_hash(&event.pubkey.to_bytes());
                     self.remove_d_tagged_event(
                         event.created_at,
                         d_value,
                         event.kind,
-                        event.pubkey,
+                        pubkey,
                         Some(&event.id),
                     )?;
                 }
             }
             5 => {
                 for t in &event.tags {
-                    if let ("e", Some((FirstTagValue::Hex32(v), _))) = (t.0.as_ref(), &t.1) {
-                        let e = EventId::from(*v);
-                        let mut is_valid = true;
-                        if let Some(n) = self.id_to_n(e) {
-                            if let Some(e) = self.n_to_event_get(n) {
+                    if let ("e", Some((FirstTagValue::Hex32(a), _))) = (t.0.as_ref(), &t.1) {
+                        let (n, e) = if let Some(a) = self.hash_to_n_get(a) {
+                            a
+                        } else {
+                            self.n_count += 1;
+                            let n = self.n_count;
+                            (
+                                n,
+                                HashToNEntry::Unknown {
+                                    deletion_requested_by: Vec::new(),
+                                },
+                            )
+                        };
+                        match e {
+                            HashToNEntry::Unknown {
+                                mut deletion_requested_by,
+                            } => {
+                                if !deletion_requested_by.contains(&author) {
+                                    deletion_requested_by.push(author);
+                                }
+                                self.hash_to_n_set_deletion_requested(a, n, &deletion_requested_by);
+                            }
+                            HashToNEntry::Have => {
+                                let e = self.n_to_event_get(n).unwrap();
                                 if event.pubkey == e.pubkey {
                                     self.remove_event(n);
                                 } else {
-                                    is_valid = false;
+                                    continue;
                                 }
                             }
-                        }
-                        if is_valid {
-                            self.deleted_insert(&event.pubkey, &e);
+                            HashToNEntry::Deleted => continue,
                         }
                     }
                     if let ("a", Some((FirstTagValue::String(v), _))) = (t.0.as_ref(), &t.1) {
@@ -240,6 +333,7 @@ impl Db {
                                 if let (Ok(kind), Ok(pubkey)) =
                                     (kind.parse::<u32>(), PubKey::from_str(pubkey))
                                 {
+                                    let pubkey = self.get_n_from_hash(&pubkey.to_bytes());
                                     let _ = self.remove_d_tagged_event(
                                         event.created_at,
                                         d_value,
@@ -255,22 +349,19 @@ impl Db {
             }
             _ => (),
         }
-        let n = self.next_n;
-        self.next_n = n + 1;
         let time = Time(event.created_at, n);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
+            let value = FirstTagValueCompact::new(value, self);
             self.conditions
-                .put(key_to_vec(&Condition::Tag(tag, value.clone()), time), [])
+                .put(key_to_vec(&ConditionCompact::Tag(tag, value), time), [])
                 .unwrap();
         }
+        let pubkey = self.get_n_from_hash(&event.pubkey.to_bytes());
         self.conditions
-            .put(key_to_vec(&Condition::Author(event.pubkey), time), [])
+            .put(key_to_vec(&ConditionCompact::Author(pubkey), time), [])
             .unwrap();
         self.conditions
-            .put(key_to_vec(&Condition::Id(event.id), time), [])
-            .unwrap();
-        self.conditions
-            .put(key_to_vec(&Condition::Kind(event.kind), time), [])
+            .put(key_to_vec(&ConditionCompact::Kind(event.kind), time), [])
             .unwrap();
         self.time_insert(time);
         self.n_to_event_insert(n, &event);
@@ -282,12 +373,13 @@ impl Db {
         earlier_than: u64,
         d_value: &FirstTagValue,
         kind: u32,
-        author: PubKey,
+        author: u64,
         id: Option<&EventId>,
     ) -> Result<(), AddEventError> {
-        let author = Condition::Author(author);
-        let kind = Condition::Kind(kind);
-        let d_tag = Condition::Tag(b'd', d_value.clone());
+        let d_value_compact = FirstTagValueCompact::new(d_value, self);
+        let author = ConditionCompact::Author(author);
+        let kind = ConditionCompact::Kind(kind);
+        let d_tag = ConditionCompact::Tag(b'd', d_value_compact);
         let mut outdated = None;
         {
             let mut i = GetEvents {
@@ -295,15 +387,15 @@ impl Db {
                 and_conditions: PriorityQueue::from([
                     (
                         OrderedFloat(200.),
-                        ConditionsWithLatest::new(vec![&d_tag], self, 2),
+                        ConditionsWithLatest::new(vec![d_tag], self, 2),
                     ),
                     (
                         OrderedFloat(100.),
-                        ConditionsWithLatest::new(vec![&author], self, 0),
+                        ConditionsWithLatest::new(vec![author], self, 0),
                     ),
                     (
                         OrderedFloat(0.),
-                        ConditionsWithLatest::new(vec![&kind], self, 1),
+                        ConditionsWithLatest::new(vec![kind], self, 1),
                     ),
                 ]),
             };
@@ -335,29 +427,26 @@ impl Db {
             return;
         };
         self.n_to_event_remove(n);
+        self.hash_to_n_set_deleted(event.id.as_byte_array(), n);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
+            let value = FirstTagValueCompact::new(value, self);
             self.conditions
                 .delete(key_to_vec(
-                    &Condition::Tag(tag, value.clone()),
+                    &ConditionCompact::Tag(tag, value),
                     Time(event.created_at, n),
                 ))
                 .unwrap();
         }
+        let pubkey = self.get_n_from_hash(&event.pubkey.to_bytes());
         self.conditions
             .delete(key_to_vec(
-                &Condition::Author(event.pubkey),
+                &ConditionCompact::Author(pubkey),
                 Time(event.created_at, n),
             ))
             .unwrap();
         self.conditions
             .delete(key_to_vec(
-                &Condition::Id(event.id),
-                Time(event.created_at, n),
-            ))
-            .unwrap();
-        self.conditions
-            .delete(key_to_vec(
-                &Condition::Kind(event.kind),
+                &ConditionCompact::Kind(event.kind),
                 Time(event.created_at, n),
             ))
             .unwrap();
@@ -393,13 +482,17 @@ pub struct ConditionsWithLatestStopped {
 }
 
 impl<'a> ConditionsWithLatest<'a> {
-    fn new(conditions: Vec<&Condition>, db: &'a Db, id: u32) -> Self {
+    fn new<T: Borrow<ConditionCompact>>(
+        conditions: impl IntoIterator<Item = T>,
+        db: &'a Db,
+        id: u32,
+    ) -> Self {
         ConditionsWithLatest {
             or_conditions: PriorityQueue::new(),
             remained: conditions
                 .into_iter()
                 .map(|condition| ConditionAndIter {
-                    condition: condition.to_vec(),
+                    condition: condition.borrow().to_vec(),
                     db: db.conditions.iterator(IteratorMode::End),
                 })
                 .collect(),
@@ -540,7 +633,7 @@ pub struct GetEvents<'a> {
 }
 
 impl<'a> GetEvents<'a> {
-    pub fn new(filter: &Filter, db: &'a Db) -> Option<Self> {
+    pub fn new(filter: &FilterCompact, db: &'a Db) -> Option<Self> {
         if filter.search.is_some() {
             return None;
         }
@@ -551,7 +644,7 @@ impl<'a> GetEvents<'a> {
             }
             and_conditions.push(
                 OrderedFloat(*priority),
-                ConditionsWithLatest::new(cs.iter().collect(), db, i as u32),
+                ConditionsWithLatest::new(cs.iter(), db, i as u32),
             );
         }
         Some(GetEvents {

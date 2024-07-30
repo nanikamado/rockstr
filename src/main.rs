@@ -16,8 +16,9 @@ use axum::Router;
 use display_as_json::AsJson;
 use error::Error;
 use expiration_queue::wait_expiration;
+use itertools::Itertools;
 use log::{debug, info, warn};
-use nostr::{ClientToRelay, Event, FirstTagValue, PubKey, Tag};
+use nostr::{ClientToRelay, Event, FilterCompact, FirstTagValue, PubKey, Tag};
 use parking_lot::RwLock;
 use rand::RngCore;
 use relay::{AddEventError, Db, GetEvents, GetEventsStopped, Time};
@@ -92,7 +93,8 @@ pub async fn root(
                     challenge: hex::encode(challenge),
                     authed_pubkey: None,
                 };
-                let _ = ws_handler(state, &mut cs).await;
+                let a = ws_handler(state, &mut cs).await;
+                debug!("ws close: {a:?}");
                 let _ = cs.ws.close().await;
             }),
         Err(e) => {
@@ -145,6 +147,9 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
                         if let Some(r) = handle_message(&state, cs, m).await? {
                             break r;
                         }
+                    }
+                    Ok(Some(Err(e))) => {
+                        debug!("ws error: {e}");
                     }
                     Err(e) => {
                         debug!("timeout: {e}");
@@ -230,51 +235,69 @@ async fn handle_message(
                     ClientToRelay::Req { id, filters } => {
                         debug!("req with {s}");
                         'filters_loop: for f in &filters {
+                            let f = {
+                                let mut db = state.db.write();
+                                FilterCompact::new(f, &mut db)
+                            };
                             let mut limit = f.limit;
-                            enum St {
-                                Init,
-                                Middle(GetEventsStopped),
-                                End,
-                            }
-                            let mut continuation = St::Init;
-                            loop {
-                                let mut ms = Vec::with_capacity(100);
-                                continuation = {
+                            if let Some(ids) = f.ids {
+                                let es = {
                                     let db = state.db.read();
-                                    let mut s = match continuation {
-                                        St::Init => {
-                                            let Some(s) = GetEvents::new(f, &db) else {
-                                                continue 'filters_loop;
-                                            };
-                                            s
-                                        }
-                                        St::Middle(s) => s.restart(&db),
-                                        St::End => panic!(),
-                                    };
-                                    loop {
-                                        if limit == 0 {
-                                            break St::End;
-                                        }
-                                        limit -= 1;
-                                        let Some(Time(t, n)) = s.next(&db) else {
-                                            break St::End;
-                                        };
-                                        if t < f.since {
-                                            break St::End;
-                                        }
-                                        let e = db.n_to_event_get(n).unwrap();
-                                        let m = Message::Text(event_message(&id, &e));
-                                        ms.push(m);
-                                        if ms.len() >= 100 {
-                                            break St::Middle(s.stop());
-                                        }
-                                    }
+                                    ids.into_iter()
+                                        .map(|id| db.n_to_event_get(id).unwrap())
+                                        .sorted_by_key(|e| (e.created_at, e.id))
+                                        .take(limit as usize)
                                 };
-                                for m in ms {
+                                for e in es {
+                                    let m = Message::Text(event_message(&id, &e));
                                     cs.ws.send(m).await?;
                                 }
-                                if matches!(continuation, St::End) {
-                                    continue 'filters_loop;
+                            } else {
+                                enum St {
+                                    Init,
+                                    Middle(GetEventsStopped),
+                                    End,
+                                }
+                                let mut continuation = St::Init;
+                                loop {
+                                    let mut ms = Vec::with_capacity(100);
+                                    continuation = {
+                                        let db = state.db.read();
+                                        let mut s = match continuation {
+                                            St::Init => {
+                                                let Some(s) = GetEvents::new(&f, &db) else {
+                                                    continue 'filters_loop;
+                                                };
+                                                s
+                                            }
+                                            St::Middle(s) => s.restart(&db),
+                                            St::End => panic!(),
+                                        };
+                                        loop {
+                                            if limit == 0 {
+                                                break St::End;
+                                            }
+                                            limit -= 1;
+                                            let Some(Time(t, n)) = s.next(&db) else {
+                                                break St::End;
+                                            };
+                                            if t < f.since {
+                                                break St::End;
+                                            }
+                                            let e = db.n_to_event_get(n).unwrap();
+                                            let m = Message::Text(event_message(&id, &e));
+                                            ms.push(m);
+                                            if ms.len() >= 100 {
+                                                break St::Middle(s.stop());
+                                            }
+                                        }
+                                    };
+                                    for m in ms {
+                                        cs.ws.send(m).await?;
+                                    }
+                                    if matches!(continuation, St::End) {
+                                        continue 'filters_loop;
+                                    }
                                 }
                             }
                         }
@@ -340,11 +363,6 @@ async fn handle_event(
         } else if (20_000..30_000).contains(&event.kind) {
             let _ = state.broadcast_sender.send(event);
             (true, "")
-        } else if let Err(e) = db.check_event_id(&event.pubkey, &id) {
-            match e {
-                relay::EventIdError::Duplicated => (true, "duplicate: already have this event"),
-                relay::EventIdError::Deleted => (false, "deleted: user requested deletion"),
-            }
         } else {
             let (ex, protected) = important_tags(&event);
             if ex.map_or(false, |e| e <= now) {
@@ -364,6 +382,8 @@ async fn handle_event(
                         (true, "")
                     }
                     Err(AddEventError::HaveNewer) => (true, "duplicate: have a newer event"),
+                    Err(AddEventError::Duplicated) => (true, "duplicate: already have this event"),
+                    Err(AddEventError::Deleted) => (false, "deleted: user requested deletion"),
                 }
             }
         }

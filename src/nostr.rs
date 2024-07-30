@@ -1,3 +1,4 @@
+use crate::relay::Db;
 use bitcoin_hashes::hex::DisplayHex;
 use bitcoin_hashes::{sha256, Hash};
 use secp256k1::schnorr::Signature;
@@ -76,7 +77,7 @@ impl std::str::FromStr for PubKey {
 }
 
 impl PubKey {
-    pub fn to_bytes(&self) -> [u8; 32] {
+    pub fn to_bytes(self) -> [u8; 32] {
         self.0.serialize()
     }
 
@@ -189,6 +190,22 @@ impl FirstTagValue {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[serde(untagged)]
+pub enum FirstTagValueCompact {
+    Hex32(u64),
+    String(String),
+}
+
+impl FirstTagValueCompact {
+    pub fn new(v: &FirstTagValue, db: &mut Db) -> Self {
+        match v {
+            FirstTagValue::Hex32(a) => Self::Hex32(db.get_n_from_hash(a)),
+            FirstTagValue::String(a) => Self::String(a.clone()),
+        }
+    }
+}
+
 #[test]
 fn tag_value_serde_test() {
     let t: FirstTagValue = serde_json::from_str(r#""aa""#).unwrap();
@@ -241,6 +258,7 @@ pub struct Filter {
     pub until: u64,
     #[serde(default = "limit_default")]
     pub limit: u32,
+    pub ids: Option<BTreeSet<EventId>>,
     #[serde(flatten, deserialize_with = "deserialize_tags")]
     pub conditions: Vec<(Priority, BTreeSet<Condition>)>,
     pub search: Option<IgnoredAny>,
@@ -254,16 +272,51 @@ impl Filter {
         let tags: BTreeSet<_> = SingleLetterTags::new(&e.tags)
             .map(|(c, v)| Condition::Tag(c, v.clone()))
             .collect();
+        if !self.ids.as_ref().map_or(true, |ids| ids.contains(&e.id)) {
+            return false;
+        }
         for (_, c) in &self.conditions {
             if !c.contains(&Condition::Author(e.pubkey))
                 && !c.contains(&Condition::Kind(e.kind))
-                && !c.contains(&Condition::Id(e.id))
                 && c.is_disjoint(&tags)
             {
                 return false;
             }
         }
         true
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FilterCompact {
+    pub since: u64,
+    pub until: u64,
+    pub limit: u32,
+    pub ids: Option<BTreeSet<u64>>,
+    pub conditions: Vec<(Priority, BTreeSet<ConditionCompact>)>,
+    pub search: Option<IgnoredAny>,
+}
+
+impl FilterCompact {
+    pub fn new(f: &Filter, db: &mut Db) -> Self {
+        let mut new_conditions = Vec::with_capacity(f.conditions.len());
+        for (priority, cs) in &f.conditions {
+            new_conditions.push((
+                *priority,
+                cs.iter().map(|c| ConditionCompact::new(c, db)).collect(),
+            ));
+        }
+        Self {
+            since: f.since,
+            until: f.until,
+            limit: f.limit,
+            ids: f
+                .ids
+                .as_ref()
+                .map(|ids| ids.iter().flat_map(|id| db.id_to_existing_n(*id)).collect()),
+            conditions: new_conditions,
+            search: f.search,
+        }
     }
 }
 
@@ -298,43 +351,34 @@ pub enum Condition {
     Tag(u8, FirstTagValue),
     Author(PubKey),
     Kind(u32),
-    Id(EventId),
-    Deleted(EventId),
 }
 
-impl Condition {
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub enum ConditionCompact {
+    Tag(u8, FirstTagValueCompact),
+    Author(u64),
+    Kind(u32),
+}
+
+impl ConditionCompact {
     pub fn write_bytes(&self, buff: &mut Vec<u8>) -> io::Result<()> {
         match self {
-            Condition::Id(a) => {
-                buff.push(0);
-                buff.write_all(a.as_byte_array())?;
+            ConditionCompact::Author(a) => {
+                buff.write_all(&a.to_be_bytes())?;
                 buff.push(0);
             }
-            Condition::Author(a) => {
-                buff.push(0);
-                buff.write_all(&a.to_bytes())?;
-                buff.push(1);
-            }
-            Condition::Tag(c, FirstTagValue::Hex32(a)) => {
-                buff.push(0);
-                buff.write_all(a)?;
+            ConditionCompact::Tag(c, FirstTagValueCompact::Hex32(a)) => {
+                buff.write_all(&a.to_be_bytes())?;
                 buff.push(*c);
             }
-            Condition::Tag(c, FirstTagValue::String(a)) => {
+            ConditionCompact::Tag(c, FirstTagValueCompact::String(a)) => {
                 buff.push(*c);
                 buff.write_all(a.as_bytes())?;
                 buff.push(0xff);
             }
-            Condition::Kind(k) => {
+            ConditionCompact::Kind(k) => {
                 buff.push(1);
                 buff.write_all(&k.to_be_bytes())?;
-                // TODO: remove
-                buff.push(0xff);
-            }
-            Condition::Deleted(a) => {
-                buff.push(0);
-                buff.write_all(a.as_byte_array())?;
-                buff.push(2);
             }
         }
         Ok(())
@@ -344,6 +388,17 @@ impl Condition {
         let mut buff = Vec::with_capacity(10);
         self.write_bytes(&mut buff).unwrap();
         buff
+    }
+
+    pub fn new(c: &Condition, db: &mut Db) -> ConditionCompact {
+        match c {
+            Condition::Tag(k, v) => ConditionCompact::Tag(*k, FirstTagValueCompact::new(v, db)),
+            Condition::Author(a) => {
+                let n = db.get_n_from_hash(&a.to_bytes());
+                ConditionCompact::Author(n)
+            }
+            Condition::Kind(a) => ConditionCompact::Kind(*a),
+        }
     }
 }
 
@@ -392,14 +447,6 @@ where
                             .map(Condition::Kind)
                             .collect();
                         tags.push((0., s))
-                    }
-                    "ids" => {
-                        let s = map
-                            .next_value::<Vec<EventId>>()?
-                            .into_iter()
-                            .map(Condition::Id)
-                            .collect();
-                        tags.push((1000., s))
                     }
                     _ => {
                         if key.len() == 2 && key.starts_with('#') {
