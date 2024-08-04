@@ -3,7 +3,6 @@ use crate::relay::Time;
 use crate::AppState;
 use rocksdb::DB as Rocks;
 use std::fs::create_dir_all;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
@@ -13,7 +12,7 @@ pub async fn wait_expiration(
     mut event_expiration_receiver: tokio::sync::mpsc::Receiver<Time>,
 ) -> Result<(), Error> {
     let far_future = far_future();
-    let config_dir = Path::new("rockstr");
+    let config_dir = &state.config_dir.join(&state.config.db_dir);
     create_dir_all(config_dir).unwrap();
     let mut opts = rocksdb::Options::default();
     opts.create_if_missing(true);

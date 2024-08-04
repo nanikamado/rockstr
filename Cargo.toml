@@ -22,3 +22,4 @@ qp-trie = "0.8.2"
 rand = "0.8.5"
 rocksdb = { version = "0.22.0", default-features = false, features = ["lz4"] }
 ordered-float = { version = "4.0", default-features = false }
+toml = "0.8.19"

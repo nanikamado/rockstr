@@ -22,54 +22,38 @@ use nostr::{ClientToRelay, Event, FilterCompact, FirstTagValue, PubKey, Tag};
 use parking_lot::RwLock;
 use rand::RngCore;
 use relay::{AddEventError, Db, GetEvents, GetEventsStopped, Time};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Deserialize;
 use serde_json::json;
 use smallvec::SmallVec;
+use std::env;
 use std::fmt::Debug;
-use std::str::FromStr;
-use std::sync::{Arc, LazyLock as Lazy};
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-const BIND_ADDRESS: &str = "127.0.0.1:8017";
-static TRUSTED_PUBKEY: Lazy<PubKey> = Lazy::new(|| {
-    PubKey::from_str("dbf6f6efae0173423554cab58709c0744be59d644dc18ac67351aa5342455450").unwrap()
-});
 
 #[derive(Debug)]
 pub struct AppState {
     db: RwLock<Db>,
     broadcast_sender: tokio::sync::broadcast::Sender<Arc<Event>>,
     event_expiration_sender: tokio::sync::mpsc::Sender<Time>,
+    config: Config,
+    config_dir: PathBuf,
 }
 
 pub async fn listen(state: Arc<AppState>) -> Result<(), Error> {
-    info!("Listening on {BIND_ADDRESS}");
+    let bind_address = state.config.bind_address.clone();
+    info!("Listening on {bind_address}");
     let app = Router::new()
         .route("/", get(root))
         .fallback(handler_404)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&bind_address).await.unwrap();
     Ok(axum::serve(listener, app).await?)
 }
-
-const MAX_MESSAGE_LENGTH: usize = 0xFFFF;
-const CREATED_AT_UPPER_LIMIT: u64 = 600;
-
-static RELAY_INFORMATION: Lazy<String> = Lazy::new(|| {
-    json!({
-        "description": "This is a rockstr instance.",
-        "name": "rockstr for momostr",
-        "software": "rockstr",
-        "supported_nips": [1, 9, 11, 40],
-        "version": "0.0.1",
-        "limitation": {
-            "max_message_length": MAX_MESSAGE_LENGTH,
-            "created_at_upper_limit": CREATED_AT_UPPER_LIMIT,
-        },
-    })
-    .to_string()
-});
 
 pub async fn root(
     State(state): State<Arc<AppState>>,
@@ -106,14 +90,26 @@ pub async fn root(
                 .and_then(|a| a.to_str().ok())
                 .map_or(false, |a| a.contains("application/nostr+json"))
             {
-                let mut r = RELAY_INFORMATION.as_str().into_response();
+                let mut r = json!({
+                    "description": state.config.relay_description,
+                    "name": state.config.relay_name,
+                    "software": "rockstr",
+                    "supported_nips": [1, 9, 11, 40],
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "limitation": {
+                        "max_message_length": state.config.max_message_length,
+                        "created_at_upper_limit": state.config.created_at_upper_limit,
+                    },
+                })
+                .to_string()
+                .into_response();
                 r.headers_mut().insert(
                     axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
                     axum::http::header::HeaderValue::from_static("*"),
                 );
                 r
             } else {
-                "rockstr relay\n".into_response()
+                state.config.relay_description.clone().into_response()
             }
         }
     }
@@ -346,20 +342,22 @@ async fn handle_event(
     use axum::extract::ws::Message;
     let id = event.id;
     let mut expiration = None;
-    let (accepted, message) = if event_len > MAX_MESSAGE_LENGTH {
+    let (accepted, message) = if event_len > state.config.max_message_length {
         (false, "invalid: too large event")
     } else {
         let mut db = state.db.write();
-        if db.blocked_pubkeys.contains(&event.pubkey) {
+        if state.config.banned_pubkeys.contains(&event.pubkey) {
             (false, "blocked")
         } else if !event.verify_hash() {
             (false, "invalid: bad event id")
         } else if !event.verify_sig() {
             (false, "invalid: bad signature")
-        } else if event.created_at > now + CREATED_AT_UPPER_LIMIT {
+        } else if event.created_at > now + state.config.created_at_upper_limit {
             (false, "invalid: created_at too early")
         } else if is_auth {
-            if event.kind == 22_242 && verify_auth(cs, &event, now) {
+            if event.kind == 22_242
+                && verify_auth(&state.config.relay_name_for_auth, cs, &event, now)
+            {
                 cs.authed_pubkey = Some(event.pubkey);
                 (true, "")
             } else {
@@ -374,7 +372,7 @@ async fn handle_event(
                 (false, "invalid: event expired")
             } else if protected
                 && cs.authed_pubkey != Some(event.pubkey)
-                && cs.authed_pubkey != Some(*TRUSTED_PUBKEY)
+                && cs.authed_pubkey != state.config.admin_pubkey
             {
                 if cs.authed_pubkey.is_some() {
                     (false, "restricted: event marked as protected")
@@ -408,14 +406,14 @@ async fn handle_event(
     Ok(())
 }
 
-fn verify_auth(cs: &ConnectionState, event: &Event, now: u64) -> bool {
+fn verify_auth(relay_name_for_auth: &str, cs: &ConnectionState, event: &Event, now: u64) -> bool {
     let mut relay = false;
     let mut challenge = false;
     for Tag(k, v) in &event.tags {
         if let Some((FirstTagValue::String(v), _)) = v {
             match k.as_str() {
                 "relay" => {
-                    relay = v.starts_with("wss://rockstr.momostr.pink");
+                    relay = v.contains(relay_name_for_auth);
                 }
                 "challenge" => {
                     challenge = *v == cs.challenge;
@@ -432,23 +430,60 @@ async fn handler_404(uri: axum::http::Uri) -> Error {
     Error::NotFound
 }
 
+#[derive(Debug, Deserialize)]
+struct Config {
+    bind_address: String,
+    banned_pubkeys: FxHashSet<PubKey>,
+    relay_name_for_auth: String,
+    admin_pubkey: Option<PubKey>,
+    #[serde(default = "max_message_length_default")]
+    max_message_length: usize,
+    #[serde(default = "created_at_upper_limit_default")]
+    created_at_upper_limit: u64,
+    #[serde(default = "relay_description_default")]
+    relay_description: String,
+    #[serde(default = "relay_name_default")]
+    relay_name: String,
+    #[serde(default)]
+    db_dir: String,
+}
+
+fn max_message_length_default() -> usize {
+    0xFFFF
+}
+
+fn created_at_upper_limit_default() -> u64 {
+    600
+}
+
+fn relay_description_default() -> String {
+    "A rockstr instance".to_string()
+}
+
+fn relay_name_default() -> String {
+    "rockstr default".to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
+    let args = env::args().collect_vec();
+    let config_file = args.get(1).unwrap();
+    let config_file = PathBuf::from(config_file);
+    let mut f = File::open(&config_file).unwrap();
+    let mut contents = String::new();
+    f.read_to_string(&mut contents).unwrap();
+    let config: Config = toml::from_str(&contents).unwrap();
+
     let broadcast_sender = tokio::sync::broadcast::Sender::new(1000);
     let (event_expiration_sender, event_expiration_receiver) = tokio::sync::mpsc::channel(10);
-    let mut db = Db::default();
-    for k in [
-        "642317135fd4c4205323b9dea8af3270657e62d51dc31a657c0ec8aab31c6288",
-        "0a7c232a5c4dd0d472d34ca6e768529dffd4683e1968a236a5c789d86837a856",
-    ] {
-        db.blocked_pubkeys.insert(PubKey::from_str(k).unwrap());
-    }
-
+    let db = Db::default();
     let state = Arc::new(AppState {
         db: RwLock::new(db),
         broadcast_sender,
         event_expiration_sender,
+        config,
+        config_dir: config_file.parent().unwrap().to_path_buf(),
     });
     tokio::try_join!(
         listen(state.clone()),

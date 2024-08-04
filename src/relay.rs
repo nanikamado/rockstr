@@ -6,7 +6,6 @@ use crate::priority_queue::PriorityQueue;
 use bitcoin_hashes::hex::DisplayHex;
 use ordered_float::OrderedFloat;
 use rocksdb::{DBIteratorWithThreadMode as RocksIter, IteratorMode, DB as Rocks};
-use rustc_hash::FxHashSet;
 use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::fs::create_dir_all;
@@ -66,7 +65,7 @@ pub struct Db {
     pub conditions: Rocks,
     /// [Time] -> []
     pub time: Rocks,
-    pub blocked_pubkeys: FxHashSet<PubKey>,
+    // pub blocked_pubkeys: FxHashSet<PubKey>,
 }
 
 impl Default for Db {
@@ -91,7 +90,7 @@ impl Default for Db {
             hash_to_n,
             conditions,
             time,
-            blocked_pubkeys: Default::default(),
+            // blocked_pubkeys: Default::default(),
         }
     }
 }
