@@ -93,7 +93,7 @@ pub async fn root(
                 let mut r = json!({
                     "description": state.config.relay_description,
                     "name": state.config.relay_name,
-                    "software": "rockstr",
+                    "software": "git+https://github.com/nanikamado/rockstr.git",
                     "supported_nips": [1, 9, 11, 40],
                     "version": env!("CARGO_PKG_VERSION"),
                     "limitation": {
@@ -433,6 +433,7 @@ async fn handler_404(uri: axum::http::Uri) -> Error {
 #[derive(Debug, Deserialize)]
 struct Config {
     bind_address: String,
+    #[serde(default)]
     banned_pubkeys: FxHashSet<PubKey>,
     relay_name_for_auth: String,
     admin_pubkey: Option<PubKey>,
