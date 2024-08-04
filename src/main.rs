@@ -106,7 +106,12 @@ pub async fn root(
                 .and_then(|a| a.to_str().ok())
                 .map_or(false, |a| a.contains("application/nostr+json"))
             {
-                RELAY_INFORMATION.as_str().into_response()
+                let mut r = RELAY_INFORMATION.as_str().into_response();
+                r.headers_mut().insert(
+                    axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                    axum::http::header::HeaderValue::from_static("*"),
+                );
+                r
             } else {
                 "rockstr relay\n".into_response()
             }
@@ -371,7 +376,11 @@ async fn handle_event(
                 && cs.authed_pubkey != Some(event.pubkey)
                 && cs.authed_pubkey != Some(*TRUSTED_PUBKEY)
             {
-                (false, "blocked: event marked as protected")
+                if cs.authed_pubkey.is_some() {
+                    (false, "restricted: event marked as protected")
+                } else {
+                    (false, "auth-required: event marked as protected")
+                }
             } else {
                 match db.add_event(event.clone()) {
                     Ok(n) => {
@@ -429,10 +438,13 @@ async fn main() -> Result<(), Error> {
     let broadcast_sender = tokio::sync::broadcast::Sender::new(1000);
     let (event_expiration_sender, event_expiration_receiver) = tokio::sync::mpsc::channel(10);
     let mut db = Db::default();
-    db.blocked_pubkeys.insert(
-        PubKey::from_str("0a7c232a5c4dd0d472d34ca6e768529dffd4683e1968a236a5c789d86837a856")
-            .unwrap(),
-    );
+    for k in [
+        "642317135fd4c4205323b9dea8af3270657e62d51dc31a657c0ec8aab31c6288",
+        "0a7c232a5c4dd0d472d34ca6e768529dffd4683e1968a236a5c789d86837a856",
+    ] {
+        db.blocked_pubkeys.insert(PubKey::from_str(k).unwrap());
+    }
+
     let state = Arc::new(AppState {
         db: RwLock::new(db),
         broadcast_sender,
