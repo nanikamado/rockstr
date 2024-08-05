@@ -269,16 +269,14 @@ impl Filter {
         if !(self.since <= e.created_at && e.created_at <= self.until) || self.search.is_some() {
             return false;
         }
-        let tags: BTreeSet<_> = SingleLetterTags::new(&e.tags)
-            .map(|(c, v)| Condition::Tag(c, v.clone()))
-            .collect();
         if !self.ids.as_ref().map_or(true, |ids| ids.contains(&e.id)) {
             return false;
         }
         for (_, c) in &self.conditions {
             if !c.contains(&Condition::Author(e.pubkey))
                 && !c.contains(&Condition::Kind(e.kind))
-                && c.is_disjoint(&tags)
+                && SingleLetterTags::new(&e.tags)
+                    .all(|(k, v)| !c.contains(&Condition::Tag(k, v.clone())))
             {
                 return false;
             }
