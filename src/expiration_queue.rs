@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::relay::Time;
+use crate::relay::{HashStatus, Time};
 use crate::AppState;
 use rocksdb::DB as Rocks;
 use std::fs::create_dir_all;
@@ -55,7 +55,7 @@ fn delete_expired_events(state: &AppState, queue_db: &Rocks) {
             break;
         }
         queue_db.delete(s).unwrap();
-        db.remove_event(t.1);
+        db.remove_event(t.1, HashStatus::Unknown);
     }
 }
 

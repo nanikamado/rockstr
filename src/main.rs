@@ -478,13 +478,14 @@ async fn main() -> Result<(), Error> {
 
     let broadcast_sender = tokio::sync::broadcast::Sender::new(1000);
     let (event_expiration_sender, event_expiration_receiver) = tokio::sync::mpsc::channel(10);
-    let db = Db::default();
+    let config_dir = config_file.parent().unwrap().to_path_buf();
+    let db = Db::new(&config_dir);
     let state = Arc::new(AppState {
         db: RwLock::new(db),
         broadcast_sender,
         event_expiration_sender,
         config,
-        config_dir: config_file.parent().unwrap().to_path_buf(),
+        config_dir,
     });
     tokio::try_join!(
         listen(state.clone()),

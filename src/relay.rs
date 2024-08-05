@@ -10,21 +10,31 @@ use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::fs::create_dir_all;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
 type UnixTime = u64;
 
-const HASH_TO_N_UNKNOWN: u8 = 2;
-const HASH_TO_N_HAVE: u8 = 1;
-const HASH_TO_N_DELETED: u8 = 3;
+#[repr(u8)]
+pub enum HashStatus {
+    Have = 1,
+    Unknown = 2,
+    Deleted = 3,
+    Outdated = 4,
+}
+
+const HASH_TO_N_UNKNOWN: u8 = HashStatus::Unknown as u8;
+const HASH_TO_N_HAVE: u8 = HashStatus::Have as u8;
+const HASH_TO_N_DELETED: u8 = HashStatus::Deleted as u8;
+const HASH_TO_N_OUTDATED: u8 = HashStatus::Outdated as u8;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HashToNEntry {
     Unknown { deletion_requested_by: Vec<u64> },
     Have,
     Deleted,
+    Outdated,
 }
 
 impl HashToNEntry {
@@ -41,6 +51,7 @@ impl HashToNEntry {
                 }
             }
             HASH_TO_N_DELETED => HashToNEntry::Deleted,
+            HASH_TO_N_OUTDATED => HashToNEntry::Outdated,
             _ => {
                 panic!()
             }
@@ -58,6 +69,7 @@ pub struct Db {
     /// - hash -> n as u64, 2 (if the hash is pubkey)
     /// - hash -> n as u64, 2, \<n of the pubkey who requested the deletion as u64\>*
     /// - hash -> n as u64, 3 (if the hash is requested to be deleted by its author)
+    /// - hash -> n as u64, 4 (if the hash is an id of an outdated event)
     hash_to_n: Rocks,
     /// one of the following format:
     /// - [ConditionCompact] [Time] -> []
@@ -68,9 +80,8 @@ pub struct Db {
     // pub blocked_pubkeys: FxHashSet<PubKey>,
 }
 
-impl Default for Db {
-    fn default() -> Self {
-        let config_dir = Path::new("rockstr");
+impl Db {
+    pub fn new(config_dir: &PathBuf) -> Self {
         create_dir_all(config_dir).unwrap();
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
@@ -157,37 +168,35 @@ impl Db {
         })
     }
 
-    pub fn hash_to_n_set_unknown(&self, hash: &[u8; 32], n: u64) {
+    pub fn hash_to_n_set_status(&self, hash: &[u8; 32], n: u64, status: HashStatus) {
         let mut value = [0; 9];
         value[..8].copy_from_slice(&n.to_be_bytes());
-        value[8] = HASH_TO_N_UNKNOWN;
+        value[8] = status as u8;
         self.hash_to_n.put(hash, value).unwrap();
+    }
+
+    pub fn hash_to_n_set_unknown(&self, hash: &[u8; 32], n: u64) {
+        self.hash_to_n_set_status(hash, n, HashStatus::Unknown);
     }
 
     pub fn hash_to_n_set_have(&self, hash: &[u8; 32], n: u64) {
-        let mut value = [0; 9];
-        value[..8].copy_from_slice(&n.to_be_bytes());
-        value[8] = HASH_TO_N_HAVE;
-        self.hash_to_n.put(hash, value).unwrap();
+        self.hash_to_n_set_status(hash, n, HashStatus::Have);
     }
 
     pub fn hash_to_n_set_deleted(&self, hash: &[u8; 32], n: u64) {
-        let mut value = [0; 9];
-        value[..8].copy_from_slice(&n.to_be_bytes());
-        value[8] = HASH_TO_N_DELETED;
-        self.hash_to_n.put(hash, value).unwrap();
+        self.hash_to_n_set_status(hash, n, HashStatus::Deleted);
     }
 
     pub fn hash_to_n_set_deletion_requested(&self, hash: &[u8; 32], n: u64, requested_by: &[u64]) {
         let mut value = n.to_be_bytes().to_vec();
-        value.push(HASH_TO_N_UNKNOWN);
+        value.push(HashStatus::Unknown as u8);
         for r in requested_by {
             value.write_all(&r.to_be_bytes()).unwrap();
         }
         self.hash_to_n.put(hash, value).unwrap();
     }
 
-    pub fn get_n_from_event_id(&mut self, author: u64, id: &EventId) -> Result<u64, AddEventError> {
+    pub fn get_n_for_new_event(&mut self, author: u64, id: &EventId) -> Result<u64, AddEventError> {
         let id = id.as_byte_array();
         let n = if let Some(v) = self.hash_to_n.get(id).unwrap() {
             match HashToNEntry::from_bytes(&v) {
@@ -203,6 +212,7 @@ impl Db {
                     n
                 }
                 HashToNEntry::Deleted => return Err(AddEventError::Deleted),
+                HashToNEntry::Outdated => return Err(AddEventError::HaveNewer),
             }
         } else {
             // we do not know this id
@@ -235,7 +245,7 @@ impl Db {
 
     pub fn add_event(&mut self, event: Arc<Event>) -> Result<u64, AddEventError> {
         let author = self.get_n_from_hash(&event.pubkey.to_bytes());
-        let n = self.get_n_from_event_id(author, &event.id)?;
+        let n = self.get_n_for_new_event(author, &event.id)?;
         match event.kind {
             0 | 3 | 10000..20000 => {
                 let author = ConditionCompact::Author(author);
@@ -272,7 +282,7 @@ impl Db {
                     }
                 }
                 if let Some(n) = outdated {
-                    self.remove_event(n);
+                    self.remove_event(n, HashStatus::Outdated);
                 }
             }
             30000..40000 => {
@@ -314,12 +324,12 @@ impl Db {
                             HashToNEntry::Have => {
                                 let e = self.n_to_event_get(n).unwrap();
                                 if event.pubkey == e.pubkey {
-                                    self.remove_event(n);
+                                    self.remove_event(n, HashStatus::Deleted);
                                 } else {
                                     continue;
                                 }
                             }
-                            HashToNEntry::Deleted => continue,
+                            HashToNEntry::Deleted | HashToNEntry::Outdated => continue,
                         }
                     }
                     if let ("a", Some((FirstTagValue::String(v), _))) = (t.0.as_ref(), &t.1) {
@@ -416,17 +426,17 @@ impl Db {
             }
         }
         if let Some(n) = outdated {
-            self.remove_event(n);
+            self.remove_event(n, HashStatus::Outdated);
         }
         Ok(())
     }
 
-    pub fn remove_event(&mut self, n: u64) {
+    pub fn remove_event(&mut self, n: u64, status: HashStatus) {
         let Some(event) = self.n_to_event_get(n) else {
             return;
         };
         self.n_to_event_remove(n);
-        self.hash_to_n_set_deleted(event.id.as_byte_array(), n);
+        self.hash_to_n_set_status(event.id.as_byte_array(), n, status);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
             let value = FirstTagValueCompact::new(value, self);
             self.conditions
