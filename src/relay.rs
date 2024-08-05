@@ -3,7 +3,7 @@ use crate::nostr::{
     SingleLetterTags,
 };
 use crate::priority_queue::PriorityQueue;
-use bitcoin_hashes::hex::DisplayHex;
+use hex_conservative::DisplayHex;
 use ordered_float::OrderedFloat;
 use rocksdb::{DBIteratorWithThreadMode as RocksIter, IteratorMode, DB as Rocks};
 use std::borrow::Borrow;

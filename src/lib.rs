@@ -14,6 +14,7 @@ use axum::routing::get;
 use axum::Router;
 use display_as_json::AsJson;
 pub use error::Error;
+use hex_conservative::DisplayHex;
 use itertools::Itertools;
 use log::{debug, info, warn};
 use nostr::{ClientToRelay, Event, Filter, FilterCompact, FirstTagValue, PubKey, Tag};
@@ -105,7 +106,7 @@ pub async fn root(
                     ws,
                     broadcast_receiver: receiver,
                     req: FxHashMap::default(),
-                    challenge: hex::encode(challenge),
+                    challenge: challenge.to_lower_hex_string(),
                     authed_pubkey: None,
                 };
                 let a = ws_handler(state, &mut cs).await;
