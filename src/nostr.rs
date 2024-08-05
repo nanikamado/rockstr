@@ -1,6 +1,7 @@
 use crate::relay::Db;
 use bitcoin_hashes::hex::DisplayHex;
 use bitcoin_hashes::{sha256, Hash};
+use rustc_hash::FxHashSet;
 use secp256k1::schnorr::Signature;
 use secp256k1::{Message, XOnlyPublicKey};
 use serde::de::{self, IgnoredAny, Visitor};
@@ -8,7 +9,6 @@ use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::collections::BTreeSet;
 use std::fmt::{Debug, Display, LowerHex};
 use std::io::{self, Write};
 use std::slice;
@@ -158,7 +158,7 @@ impl<'de> Deserialize<'de> for Tag {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 #[serde(untagged)]
 pub enum FirstTagValue {
     #[serde(with = "hex::serde")]
@@ -258,9 +258,9 @@ pub struct Filter {
     pub until: u64,
     #[serde(default = "limit_default")]
     pub limit: u32,
-    pub ids: Option<BTreeSet<EventId>>,
+    pub ids: Option<FxHashSet<EventId>>,
     #[serde(flatten, deserialize_with = "deserialize_tags")]
-    pub conditions: Vec<(Priority, BTreeSet<Condition>)>,
+    pub conditions: Vec<(Priority, FxHashSet<Condition>)>,
     pub search: Option<IgnoredAny>,
 }
 
@@ -290,8 +290,8 @@ pub struct FilterCompact {
     pub since: u64,
     pub until: u64,
     pub limit: u32,
-    pub ids: Option<BTreeSet<u64>>,
-    pub conditions: Vec<(Priority, BTreeSet<ConditionCompact>)>,
+    pub ids: Option<Vec<u64>>,
+    pub conditions: Vec<(Priority, Vec<ConditionCompact>)>,
     pub search: Option<IgnoredAny>,
 }
 
@@ -344,7 +344,7 @@ impl<'a> Iterator for SingleLetterTags<'a> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Hash)]
 pub enum Condition {
     Tag(u8, FirstTagValue),
     Author(PubKey),
@@ -410,14 +410,14 @@ fn until_default() -> u64 {
 
 fn deserialize_tags<'de, D>(
     deserializer: D,
-) -> Result<Vec<(Priority, BTreeSet<Condition>)>, D::Error>
+) -> Result<Vec<(Priority, FxHashSet<Condition>)>, D::Error>
 where
     D: Deserializer<'de>,
 {
     struct TagsVisitor;
 
     impl<'de> Visitor<'de> for TagsVisitor {
-        type Value = Vec<(Priority, BTreeSet<Condition>)>;
+        type Value = Vec<(Priority, FxHashSet<Condition>)>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
             formatter.write_str("a map")
