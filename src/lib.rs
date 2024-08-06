@@ -16,8 +16,9 @@ use display_as_json::AsJson;
 pub use error::Error;
 use hex_conservative::DisplayHex;
 use itertools::Itertools;
+use lnostr::kinds;
 use log::{debug, info, warn};
-use nostr::{ClientToRelay, Event, Filter, FilterCompact, FirstTagValue, PubKey, Tag};
+use nostr::{ClientMessage, Event, Filter, FilterCompact, FirstTagValue, PubKey, Tag};
 use parking_lot::RwLock;
 use rand::RngCore;
 pub use relay::{AddEventError, Db, GetEvents, GetEventsStopped, Time};
@@ -257,15 +258,15 @@ async fn handle_message(
                     .unwrap()
                     .as_secs();
                 match m {
-                    ClientToRelay::Event(e) => {
+                    ClientMessage::Event(e) => {
                         handle_event(state, cs, e, s.len(), now, false).await?;
                         None
                     }
-                    ClientToRelay::Auth(e) => {
+                    ClientMessage::Auth(e) => {
                         handle_event(state, cs, e, s.len(), now, true).await?;
                         None
                     }
-                    ClientToRelay::Req { id, filters } => {
+                    ClientMessage::Req { id, filters } => {
                         debug!("req with {s}");
                         'filters_loop: for f in &filters {
                             let f = {
@@ -340,7 +341,7 @@ async fn handle_message(
                         cs.req.insert(id, filters);
                         None
                     }
-                    ClientToRelay::Close(id) => {
+                    ClientMessage::Close(id) => {
                         debug!("close {id}");
                         cs.req.remove(id.as_ref());
                         None
@@ -387,7 +388,7 @@ async fn handle_event(
         } else if event.created_at > now + state.config.created_at_upper_limit {
             (false, "invalid: created_at too early")
         } else if is_auth {
-            if event.kind == 22_242
+            if event.kind == kinds::CLIENT_AUTHENTICATION
                 && verify_auth(&state.config.relay_name_for_auth, cs, &event, now)
             {
                 cs.authed_pubkey = Some(event.pubkey);

@@ -1,6 +1,6 @@
 use crate::relay::Db;
-pub use light_nostr::{
-    ClientToRelay, Condition, Event, EventId, Filter, FirstTagValue, PubKey, SingleLetterTags, Tag,
+pub use lnostr::{
+    ClientMessage, Condition, Event, EventId, Filter, FirstTagValue, PubKey, SingleLetterTags, Tag,
 };
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};

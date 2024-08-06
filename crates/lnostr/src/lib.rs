@@ -1,20 +1,25 @@
+mod client_message;
+mod event_builder;
+pub mod kinds;
+mod relay_message;
+
 use bitcoin_hashes::hex::DisplayHex;
 use bitcoin_hashes::{sha256, Hash};
+pub use client_message::ClientMessage;
+pub use event_builder::EventBuilder;
 use hex::FromHex;
-use hex_conservative as hex;
+pub use relay_message::RelayMessage;
 use rustc_hash::FxHashSet;
 use secp256k1::schnorr::Signature;
+pub use secp256k1::Keypair;
 use secp256k1::{Message, XOnlyPublicKey};
 use serde::de::{self, IgnoredAny, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize};
-use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::fmt::{Debug, Display, LowerHex};
 use std::io::Write;
 use std::slice;
 use std::str::FromStr;
-use std::sync::Arc;
 
 #[derive(Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize)]
 pub struct EventId(sha256::Hash);
@@ -190,20 +195,31 @@ impl FirstTagValue {
     }
 }
 
+fn event_hash(
+    pubkey: &PubKey,
+    created_at: u64,
+    kind: u32,
+    tags: &[Tag],
+    content: &str,
+) -> sha256::Hash {
+    let mut h = sha256::HashEngine::default();
+    write!(&mut h, r#"[0,"{:x}",{},{},"#, pubkey.0, created_at, kind).unwrap();
+    serde_json::to_writer(&mut h, tags).unwrap();
+    h.write_all(b",").unwrap();
+    serde_json::to_writer(&mut h, content).unwrap();
+    h.write_all(b"]").unwrap();
+    sha256::Hash::from_engine(h)
+}
+
 impl Event {
     pub fn verify_hash(&self) -> bool {
-        let mut h = sha256::HashEngine::default();
-        write!(
-            &mut h,
-            r#"[0,"{:x}",{},{},"#,
-            self.pubkey.0, self.created_at, self.kind
-        )
-        .unwrap();
-        serde_json::to_writer(&mut h, &self.tags).unwrap();
-        h.write_all(b",").unwrap();
-        serde_json::to_writer(&mut h, &self.content).unwrap();
-        h.write_all(b"]").unwrap();
-        sha256::Hash::from_engine(h) == self.id.0
+        event_hash(
+            &self.pubkey,
+            self.created_at,
+            self.kind,
+            &self.tags,
+            &self.content,
+        ) == self.id.0
     }
 
     pub fn verify_sig(&self) -> bool {
@@ -356,87 +372,6 @@ where
     }
 
     deserializer.deserialize_map(TagsVisitor)
-}
-
-#[derive(Debug, Deserialize)]
-pub enum ClientToRelayTag {
-    #[serde(rename = "EVENT")]
-    Event,
-    #[serde(rename = "REQ")]
-    Req,
-    #[serde(rename = "CLOSE")]
-    Close,
-    #[serde(rename = "AUTH")]
-    Auth,
-}
-
-#[derive(Debug)]
-pub enum ClientToRelay<'a> {
-    Event(Arc<Event>),
-    Req {
-        id: String,
-        filters: SmallVec<[Filter; 2]>,
-    },
-    Close(Cow<'a, str>),
-    Auth(Arc<Event>),
-}
-
-impl<'a> Deserialize<'a> for ClientToRelay<'a> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'a>,
-    {
-        deserializer.deserialize_seq(ClientToRelayVisitor)
-    }
-}
-
-struct ClientToRelayVisitor;
-
-impl<'a> Visitor<'a> for ClientToRelayVisitor {
-    type Value = ClientToRelay<'a>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(formatter, "an array")
-    }
-
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::SeqAccess<'a>,
-    {
-        let tag: ClientToRelayTag = seq
-            .next_element()?
-            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-        match tag {
-            ClientToRelayTag::Event => {
-                let e = seq
-                    .next_element()?
-                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                Ok(ClientToRelay::Event(e))
-            }
-            ClientToRelayTag::Auth => {
-                let e = seq
-                    .next_element()?
-                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                Ok(ClientToRelay::Auth(e))
-            }
-            ClientToRelayTag::Req => {
-                let id = seq
-                    .next_element()?
-                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                let mut filters = SmallVec::with_capacity(seq.size_hint().unwrap_or_default());
-                while let Some(a) = seq.next_element()? {
-                    filters.push(a);
-                }
-                Ok(ClientToRelay::Req { id, filters })
-            }
-            ClientToRelayTag::Close => {
-                let id = seq
-                    .next_element()?
-                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                Ok(ClientToRelay::Close(id))
-            }
-        }
-    }
 }
 
 #[cfg(test)]

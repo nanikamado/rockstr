@@ -68,6 +68,12 @@ impl<K: Ord, V> PriorityQueue<K, V> {
     }
 }
 
+impl<K: Ord, V> Default for PriorityQueue<K, V> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
 impl<K: Ord, V, const N: usize> From<[(K, V); N]> for PriorityQueue<K, V> {
     fn from(arr: [(K, V); N]) -> Self {
         Self(BinaryHeap::from_iter(arr.map(|(k, v)| HeapValue(k, v))))

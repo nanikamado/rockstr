@@ -479,13 +479,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d231dfb89cfffdbc30e7fc41579ed6066ad03abda9e567ccafae602b97ec5024"
 
 [[package]]
+name = "hex"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "hex-conservative"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5313b072ce3c597065a808dbf612c4c8e8590bdbf8b579508bf7a762c5eae6cd"
 dependencies = [
  "arrayvec",
- "serde",
 ]
 
 [[package]]
@@ -688,11 +696,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "light_nostr"
+name = "lnostr"
 version = "0.1.0"
 dependencies = [
  "bitcoin_hashes",
- "hex-conservative",
+ "hex",
  "rustc-hash 2.0.0",
  "secp256k1",
  "serde",
@@ -1014,7 +1022,7 @@ dependencies = [
  "env_logger",
  "hex-conservative",
  "itertools 0.13.0",
- "light_nostr",
+ "lnostr",
  "log",
  "ordered-float",
  "parking_lot",
@@ -1071,6 +1079,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e0cc0f1cf93f4969faf3ea1c7d8a9faed25918d96affa959720823dfe86d4f3"
 dependencies = [
  "bitcoin_hashes",
+ "rand",
  "secp256k1-sys",
  "serde",
 ]
