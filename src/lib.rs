@@ -2,6 +2,7 @@ mod display_as_json;
 mod error;
 pub mod expiration_queue;
 pub mod nostr;
+mod plugin;
 mod priority_queue;
 mod relay;
 
@@ -20,12 +21,14 @@ use lnostr::kinds;
 use log::{debug, info, warn};
 use nostr::{ClientMessage, Event, Filter, FilterCompact, FirstTagValue, PubKey, Tag};
 use parking_lot::RwLock;
+pub use plugin::PluginState;
 use rand::RngCore;
 pub use relay::{AddEventError, Db, GetEvents, GetEventsStopped, Time};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::json;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::env;
 use std::fmt::Debug;
 use std::path::PathBuf;
@@ -49,6 +52,8 @@ pub struct Config {
     relay_name: String,
     #[serde(default)]
     db_dir: String,
+    #[serde(default)]
+    pub plugin: String,
 }
 
 fn max_message_length_default() -> usize {
@@ -74,6 +79,7 @@ pub struct AppState {
     pub event_expiration_sender: tokio::sync::mpsc::Sender<Time>,
     pub config: Config,
     pub config_dir: PathBuf,
+    pub plugin: Option<PluginState>,
 }
 
 pub async fn listen(state: Arc<AppState>) -> Result<(), Error> {
@@ -375,55 +381,75 @@ async fn handle_event(
     use axum::extract::ws::Message;
     let id = event.id;
     let mut expiration = None;
-    let (accepted, message) = if event_len > state.config.max_message_length {
-        (false, "invalid: too large event")
+    let (accepted, message): (_, Cow<str>) = if event_len > state.config.max_message_length {
+        (false, "invalid: too large event".into())
+    } else if state.config.banned_pubkeys.contains(&event.pubkey) {
+        (false, "blocked".into())
+    } else if !event.verify_hash() {
+        (false, "invalid: bad event id".into())
+    } else if !event.verify_sig() {
+        (false, "invalid: bad signature".into())
+    } else if event.created_at > now + state.config.created_at_upper_limit {
+        (false, "invalid: created_at too early".into())
+    } else if is_auth {
+        if event.kind == kinds::CLIENT_AUTHENTICATION
+            && verify_auth(
+                &state.config.relay_name_for_auth,
+                cs,
+                &event,
+                &state.config.admin_pubkey,
+                now,
+            )
+        {
+            cs.authed_pubkey = Some(event.pubkey);
+            (true, "".into())
+        } else {
+            (false, "invalid: bad auth".into())
+        }
     } else {
-        let mut db = state.db.write();
-        if state.config.banned_pubkeys.contains(&event.pubkey) {
-            (false, "blocked")
-        } else if !event.verify_hash() {
-            (false, "invalid: bad event id")
-        } else if !event.verify_sig() {
-            (false, "invalid: bad signature")
-        } else if event.created_at > now + state.config.created_at_upper_limit {
-            (false, "invalid: created_at too early")
-        } else if is_auth {
-            if event.kind == kinds::CLIENT_AUTHENTICATION
-                && verify_auth(&state.config.relay_name_for_auth, cs, &event, now)
-            {
-                cs.authed_pubkey = Some(event.pubkey);
-                (true, "")
-            } else {
-                (false, "invalid: bad auth")
-            }
+        let r = if let Some(p) = &state.plugin {
+            p.check_event(event.clone())
+                .await
+                .map(|a| a.map_err(Cow::Owned))
+                .unwrap_or_else(|_| Err("error: internal server error".into()))
+        } else {
+            Ok(())
+        };
+        if let Err(e) = r {
+            (false, e)
         } else if (20_000..30_000).contains(&event.kind) {
             let _ = state.broadcast_sender.send(event);
-            (true, "")
+            (true, "".into())
         } else {
             let (ex, protected) = important_tags(&event);
             if ex.map_or(false, |e| e <= now) {
-                (false, "invalid: event expired")
+                (false, "invalid: event expired".into())
             } else if protected
                 && cs.authed_pubkey != Some(event.pubkey)
                 && cs.authed_pubkey != state.config.admin_pubkey
             {
                 if cs.authed_pubkey.is_some() {
-                    (false, "restricted: event marked as protected")
+                    (false, "restricted: event marked as protected".into())
                 } else {
-                    (false, "auth-required: event marked as protected")
+                    (false, "auth-required: event marked as protected".into())
                 }
             } else {
+                let mut db = state.db.write();
                 match db.add_event(event.clone()) {
                     Ok(n) => {
                         let _ = state.broadcast_sender.send(event);
                         if let Some(e) = ex {
                             expiration = Some(Time(e, n));
                         }
-                        (true, "")
+                        (true, "".into())
                     }
-                    Err(AddEventError::HaveNewer) => (true, "duplicate: have a newer event"),
-                    Err(AddEventError::Duplicated) => (true, "duplicate: already have this event"),
-                    Err(AddEventError::Deleted) => (false, "deleted: user requested deletion"),
+                    Err(AddEventError::HaveNewer) => (true, "duplicate: have a newer event".into()),
+                    Err(AddEventError::Duplicated) => {
+                        (true, "duplicate: already have this event".into())
+                    }
+                    Err(AddEventError::Deleted) => {
+                        (false, "deleted: user requested deletion".into())
+                    }
                 }
             }
         }
@@ -439,7 +465,13 @@ async fn handle_event(
     Ok(())
 }
 
-fn verify_auth(relay_name_for_auth: &str, cs: &ConnectionState, event: &Event, now: u64) -> bool {
+fn verify_auth(
+    relay_name_for_auth: &str,
+    cs: &ConnectionState,
+    event: &Event,
+    admin_pubkey: &Option<PubKey>,
+    now: u64,
+) -> bool {
     let mut relay = false;
     let mut challenge = false;
     for Tag(k, v) in &event.tags {
@@ -455,7 +487,9 @@ fn verify_auth(relay_name_for_auth: &str, cs: &ConnectionState, event: &Event, n
             }
         }
     }
-    relay && challenge && event.created_at.abs_diff(now) < 600
+    (relay || &Some(event.pubkey) == admin_pubkey)
+        && challenge
+        && event.created_at.abs_diff(now) < 600
 }
 
 async fn handler_404(uri: axum::http::Uri) -> Error {

@@ -1,0 +1,35 @@
+[2024-08-15 23:44:57.058] [INFO] main: filter started
+[2024-08-15 23:45:36.570] [INFO] main: filter started
+[2024-08-15 23:45:54.296] [INFO] main: filter started
+[2024-08-15 23:59:28.621] [INFO] main: filter started
+[2024-08-16 00:00:24.231] [INFO] main: filter started
+[2024-08-16 00:16:54.670] [INFO] main: filter started
+[2024-08-16 00:18:02.463] [INFO] main: filter started
+[2024-08-16 00:22:00.603] [INFO] main: filter started
+[2024-08-16 00:22:48.015] [INFO] main: filter started
+[2024-08-16 00:23:42.299] [INFO] main: filter started
+[2024-08-16 00:23:51.590] [INFO] main: filter started
+[2024-08-16 00:24:27.077] [INFO] main: filter started
+[2024-08-16 00:25:24.746] [INFO] main: filter started
+[2024-08-16 00:26:08.790] [INFO] main: filter started
+[2024-08-16 00:26:10.996] [INFO] main: buff = {"event":{"id":"cf16558cd88c1e0640e7eb8d962ac98e9125e4393754c250f460117399db4b9a","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723735570,"kind":1,"tags":[],"content":"hello from the nostr army knife","sig":"e7447a7bb5d651b1941d935f38de9d7d0a6781059a718568b575c1592ca8539543b55bca85e29142c1e75923e2b75f3f12c58bde09c891120b5f71110cc92c8b"}}
+
+[2024-08-16 00:33:24.023] [INFO] main: buff = {"event":{"id":"bf45f2d8fd0712231e128a9b253879b4cb02076507d1f54b9e1afc226f490cbd","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723736004,"kind":0,"tags":[],"content":"https://dan.org/wp-content/themes/diversalertnetwork/apple-touch-icon.png","sig":"8b525e995c0c2ae6307daa9fa847647c3369f3cc71076603db36b197c84b2ca9bfb733c71a69ec196777d8ca534ca1b89a64d8b4a93c57846f440f71f8150a47"}}
+
+[2024-08-16 00:33:24.023] [INFO] main: add spam: {"event":{"id":"bf45f2d8fd0712231e128a9b253879b4cb02076507d1f54b9e1afc226f490cbd","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723736004,"kind":0,"tags":[],"content":"https://dan.org/wp-content/themes/diversalertnetwork/apple-touch-icon.png","sig":"8b525e995c0c2ae6307daa9fa847647c3369f3cc71076603db36b197c84b2ca9bfb733c71a69ec196777d8ca534ca1b89a64d8b4a93c57846f440f71f8150a47"}}
+
+[2024-08-16 00:40:17.009] [INFO] main: filter started
+[2024-08-16 00:40:28.227] [INFO] main: buff = {"event":{"id":"d0cbac9c14cbd4eb6711067626d7fce3fff19e31dc754156b595bdeeb8f20afa","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723736428,"kind":0,"tags":[],"content":"https://dan.org/wp-content/themes/diversalertnetwork/apple-touch-icon.png","sig":"fde58e32cd4267c930f2c2554df0a474f1696839602fc9cc802a6702d1ecfc835f684c7811649e1876f3edb413e46be89f804ed58383afd86931cb796322daf5"}}
+
+[2024-08-16 00:40:28.227] [INFO] main: add spam: {"event":{"id":"d0cbac9c14cbd4eb6711067626d7fce3fff19e31dc754156b595bdeeb8f20afa","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723736428,"kind":0,"tags":[],"content":"https://dan.org/wp-content/themes/diversalertnetwork/apple-touch-icon.png","sig":"fde58e32cd4267c930f2c2554df0a474f1696839602fc9cc802a6702d1ecfc835f684c7811649e1876f3edb413e46be89f804ed58383afd86931cb796322daf5"}}
+
+[2024-08-16 00:41:08.986] [INFO] main: buff = {"event":{"id":"76d259cca8fe5d659acdfbbdf15aec7aca415baf45af10741c3bb610fe99665d","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723736468,"kind":0,"tags":[],"content":"https://dan.org/wp-content/themes/diversalertnetwork/apple-touch-icon.png","sig":"0b4f330d626a57a148dc3511e18228890229920f51c9892390b2e4dd56da336182ca8649111caf971cf79b5944e5626b6166c4a4733b6dd0e0fedd6a65edba01"}}
+
+[2024-08-16 00:41:08.987] [INFO] main: blockd: {"event":{"id":"76d259cca8fe5d659acdfbbdf15aec7aca415baf45af10741c3bb610fe99665d","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723736468,"kind":0,"tags":[],"content":"https://dan.org/wp-content/themes/diversalertnetwork/apple-touch-icon.png","sig":"0b4f330d626a57a148dc3511e18228890229920f51c9892390b2e4dd56da336182ca8649111caf971cf79b5944e5626b6166c4a4733b6dd0e0fedd6a65edba01"}}
+
+[2024-08-16 00:41:14.222] [INFO] main: buff = {"event":{"id":"bc115137861ccf1f2a905fa8aed5a11572b22890f99969d2b538aedae49120a4","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723736474,"kind":1,"tags":[],"content":"hello from the nostr army knife","sig":"a78f63e7e40559645b67511f09f7e309e8fa5a056046d9409f27d516ca7c4e7581280e86c75cdaae9f1cf11eee60d5053441215afd7e7568326b3db6e0c85386"}}
+
+[2024-08-16 00:41:14.222] [INFO] main: blockd: {"event":{"id":"bc115137861ccf1f2a905fa8aed5a11572b22890f99969d2b538aedae49120a4","pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","created_at":1723736474,"kind":1,"tags":[],"content":"hello from the nostr army knife","sig":"a78f63e7e40559645b67511f09f7e309e8fa5a056046d9409f27d516ca7c4e7581280e86c75cdaae9f1cf11eee60d5053441215afd7e7568326b3db6e0c85386"}}
+
+[2024-08-16 00:41:20.374] [INFO] main: buff = {"event":{"id":"629ac82b9e18532e20425aad679869a6c2c70334852593edf40fb08d807de0c3","pubkey":"c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5","created_at":1723736480,"kind":1,"tags":[],"content":"hello from the nostr army knife","sig":"e134bc339b7a8180111ffaa689967a743c096fe286cab7e1855c9249791381d9d7c2973ce29f89fc3344e2d17e29b868cb07156d031badadf28b35cb8d6164d8"}}
+

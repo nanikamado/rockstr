@@ -1,7 +1,7 @@
 use expiration_queue::wait_expiration;
 use itertools::Itertools;
 use parking_lot::RwLock;
-use rockstr::{expiration_queue, listen, AppState, Config, Db, Error};
+use rockstr::{expiration_queue, listen, AppState, Config, Db, Error, PluginState};
 use std::env;
 use std::fs::File;
 use std::io::Read;
@@ -23,12 +23,18 @@ async fn main() -> Result<(), Error> {
     let (event_expiration_sender, event_expiration_receiver) = tokio::sync::mpsc::channel(10);
     let config_dir = config_file.parent().unwrap().to_path_buf();
     let db = Db::new(&config_dir);
+    let plugin = if config.plugin.is_empty() {
+        None
+    } else {
+        Some(PluginState::new(config.plugin.clone()))
+    };
     let state = Arc::new(AppState {
         db: RwLock::new(db),
         broadcast_sender,
         event_expiration_sender,
         config,
         config_dir,
+        plugin,
     });
     tokio::try_join!(
         listen(state.clone()),
