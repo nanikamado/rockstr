@@ -407,7 +407,9 @@ async fn handle_event(
             (false, "invalid: bad auth".into())
         }
     } else {
-        let r = if let Some(p) = &state.plugin {
+        let r = if cs.authed_pubkey == state.config.admin_pubkey {
+            Ok(())
+        } else if let Some(p) = &state.plugin {
             p.check_event(event.clone())
                 .await
                 .map(|a| a.map_err(Cow::Owned))
