@@ -115,6 +115,7 @@ pub async fn root(
                     req: FxHashMap::default(),
                     challenge: challenge.to_lower_hex_string(),
                     authed_pubkey: None,
+                    credit: DEFAULT_CREDIT,
                 };
                 let a = ws_handler(state, &mut cs).await;
                 debug!("ws close: {a:?}");
@@ -160,7 +161,10 @@ const TIMEOUT_DURATION: Duration = Duration::from_secs(60 * 3);
 enum CloseReason {
     WsClosed,
     NoResponse,
+    MaliciousConnection,
 }
+
+const DEFAULT_CREDIT: u32 = 30;
 
 struct ConnectionState {
     ws: WebSocket,
@@ -168,6 +172,7 @@ struct ConnectionState {
     req: FxHashMap<String, SmallVec<[Filter; 2]>>,
     challenge: String,
     authed_pubkey: Option<PubKey>,
+    credit: u32,
 }
 
 async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<CloseReason, Error> {
@@ -266,7 +271,11 @@ async fn handle_message(
                 match m {
                     ClientMessage::Event(e) => {
                         handle_event(state, cs, e, s.len(), now, false).await?;
-                        None
+                        if cs.credit == 0 {
+                            Some(CloseReason::MaliciousConnection)
+                        } else {
+                            None
+                        }
                     }
                     ClientMessage::Auth(e) => {
                         handle_event(state, cs, e, s.len(), now, true).await?;
@@ -284,7 +293,7 @@ async fn handle_message(
                                 let es = {
                                     let db = state.db.read();
                                     ids.into_iter()
-                                        .map(|id| db.n_to_event_get(id).unwrap())
+                                        .filter_map(|id| db.n_to_event_get(id))
                                         .sorted_by_key(|e| (e.created_at, e.id))
                                         .take(limit as usize)
                                 };
@@ -317,15 +326,17 @@ async fn handle_message(
                                             if limit == 0 {
                                                 break St::End;
                                             }
-                                            limit -= 1;
                                             let Some(Time(t, n)) = s.next(&db) else {
                                                 break St::End;
                                             };
                                             if t < f.since {
                                                 break St::End;
                                             }
-                                            let e = db.n_to_event_get(n).unwrap();
+                                            let Some(e) = db.n_to_event_get(n) else {
+                                                continue;
+                                            };
                                             let m = Message::Text(event_message(&id, &e));
+                                            limit -= 1;
                                             ms.push(m);
                                             if ms.len() >= 100 {
                                                 break St::Middle(s.stop());
@@ -384,6 +395,7 @@ async fn handle_event(
     let (accepted, message): (_, Cow<str>) = if event_len > state.config.max_message_length {
         (false, "invalid: too large event".into())
     } else if state.config.banned_pubkeys.contains(&event.pubkey) {
+        cs.credit = 0;
         (false, "blocked".into())
     } else if !event.verify_hash() {
         (false, "invalid: bad event id".into())
@@ -418,6 +430,7 @@ async fn handle_event(
             Ok(())
         };
         if let Err(e) = r {
+            cs.credit = cs.credit.saturating_sub(DEFAULT_CREDIT / 2);
             (false, e)
         } else if (20_000..30_000).contains(&event.kind) {
             let _ = state.broadcast_sender.send(event);
@@ -456,6 +469,9 @@ async fn handle_event(
             }
         }
     };
+    if !accepted {
+        cs.credit = cs.credit.saturating_sub(1);
+    }
     cs.ws
         .send(Message::Text(format!(
             r#"["OK","{id}",{accepted},"{message}"]"#,
