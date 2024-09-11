@@ -9,6 +9,7 @@ mod relay;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{self, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
+use axum::http::header::USER_AGENT;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -99,13 +100,18 @@ pub async fn root(
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     headers: HeaderMap,
 ) -> Response {
-    info!("root");
+    let addr = headers
+        .get("X-Forwarded-For")
+        .and_then(|a| a.to_str().ok())
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    info!("root: {addr}");
     match ws {
         Ok(ws) => ws
             .on_failed_upgrade(|a| {
                 info!("on_failed_upgrade: {a}");
             })
-            .on_upgrade(|ws| async {
+            .on_upgrade(move |ws| async move {
                 let receiver = state.broadcast_sender.subscribe();
                 let mut challenge = [0u8; 16];
                 rand::thread_rng().fill_bytes(&mut challenge);
@@ -116,6 +122,15 @@ pub async fn root(
                     challenge: challenge.to_lower_hex_string(),
                     authed_pubkey: None,
                     credit: DEFAULT_CREDIT,
+                    source_info: SourceInfo {
+                        addr,
+                        user_agent: headers
+                            .get(USER_AGENT)
+                            .and_then(|a| a.to_str().ok())
+                            .map(|a| a.to_string())
+                            .unwrap_or_default(),
+                    }
+                    .into(),
                 };
                 let a = ws_handler(state, &mut cs).await;
                 debug!("ws close: {a:?}");
@@ -166,6 +181,12 @@ enum CloseReason {
 
 const DEFAULT_CREDIT: u32 = 30;
 
+#[derive(Debug)]
+pub struct SourceInfo {
+    addr: String,
+    user_agent: String,
+}
+
 struct ConnectionState {
     ws: WebSocket,
     broadcast_receiver: tokio::sync::broadcast::Receiver<Arc<Event>>,
@@ -173,6 +194,7 @@ struct ConnectionState {
     challenge: String,
     authed_pubkey: Option<PubKey>,
     credit: u32,
+    source_info: Arc<SourceInfo>,
 }
 
 async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<CloseReason, Error> {
@@ -404,25 +426,28 @@ async fn handle_event(
     } else if event.created_at > now + state.config.created_at_upper_limit {
         (false, "invalid: created_at too early".into())
     } else if is_auth {
-        if event.kind == kinds::CLIENT_AUTHENTICATION
-            && verify_auth(
-                &state.config.relay_name_for_auth,
-                cs,
-                &event,
-                &state.config.admin_pubkey,
-                now,
+        if event.kind != kinds::CLIENT_AUTHENTICATION {
+            (
+                false,
+                format!("invalid: auth of kind {} is not supported", event.kind).into(),
             )
-        {
+        } else if !verify_auth(
+            &state.config.relay_name_for_auth,
+            cs,
+            &event,
+            &state.config.admin_pubkey,
+            now,
+        ) {
+            (false, "invalid: bad auth".into())
+        } else {
             cs.authed_pubkey = Some(event.pubkey);
             (true, "".into())
-        } else {
-            (false, "invalid: bad auth".into())
         }
     } else {
         let r = if cs.authed_pubkey == state.config.admin_pubkey {
             Ok(())
         } else if let Some(p) = &state.plugin {
-            p.check_event(event.clone())
+            p.check_event(event.clone(), cs.source_info.clone())
                 .await
                 .map(|a| a.map_err(Cow::Owned))
                 .unwrap_or_else(|_| Err("error: internal server error".into()))
@@ -469,7 +494,9 @@ async fn handle_event(
             }
         }
     };
-    if !accepted {
+    if accepted {
+        cs.credit = DEFAULT_CREDIT;
+    } else {
         cs.credit = cs.credit.saturating_sub(1);
     }
     cs.ws

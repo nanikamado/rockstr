@@ -1,3 +1,4 @@
+use crate::SourceInfo;
 use cached::{Cached, TimedCache};
 use lnostr::{Event, EventId};
 use log::error;
@@ -10,8 +11,15 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
+pub struct PluginInput {
+    event: Arc<Event>,
+    source_info: Arc<SourceInfo>,
+    sender: oneshot::Sender<PluginResponse>,
+}
+
+#[derive(Debug)]
 pub struct PluginState {
-    sender: mpsc::Sender<(Arc<Event>, oneshot::Sender<PluginResponse>)>,
+    sender: mpsc::Sender<PluginInput>,
 }
 
 type PluginResponse = Result<(), String>;
@@ -52,14 +60,20 @@ impl PluginState {
             }
         }
         async fn recv_event(
-            (e, sender): (Arc<Event>, oneshot::Sender<PluginResponse>),
+            input: PluginInput,
             stdin: &mut ChildStdin,
             es: &mut TimedCache<EventId, oneshot::Sender<PluginResponse>>,
         ) {
-            es.cache_set(e.id, sender);
+            es.cache_set(input.event.id, input.sender);
             stdin
                 .write_all(
-                    format!("{{\"event\":{}}}\n", serde_json::to_string(&e).unwrap()).as_bytes(),
+                    format!(
+                        "{{\"event\":{},\"sourceInfo\":{},\"userAgent\":{}}}\n",
+                        serde_json::to_string(&input.event).unwrap(),
+                        serde_json::to_string(&input.source_info.addr).unwrap(),
+                        serde_json::to_string(&input.source_info.user_agent).unwrap()
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .unwrap();
@@ -102,9 +116,22 @@ impl PluginState {
         PluginState { sender }
     }
 
-    pub async fn check_event(&self, e: Arc<Event>) -> Result<PluginResponse, ()> {
-        let (s, r) = oneshot::channel();
-        if self.sender.send((e, s)).await.is_ok() {
+    pub async fn check_event(
+        &self,
+        event: Arc<Event>,
+        source_info: Arc<SourceInfo>,
+    ) -> Result<PluginResponse, ()> {
+        let (sender, r) = oneshot::channel();
+        if self
+            .sender
+            .send(PluginInput {
+                event,
+                source_info,
+                sender,
+            })
+            .await
+            .is_ok()
+        {
             tokio::time::timeout(Duration::from_secs(600), r)
                 .await
                 .map_err(|_| ())?
