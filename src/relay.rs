@@ -63,7 +63,7 @@ impl HashToNEntry {
 pub struct Db {
     pub n_count: u64,
     /// [u64] -> event json
-    pub n_to_event: Rocks,
+    n_to_event: Rocks,
     /// one of the following format:
     /// - hash -> n as u64, 1 (if the hash is an id of event that we have)
     /// - hash -> n as u64, 2 (if the hash is pubkey)
@@ -269,8 +269,7 @@ impl Db {
                         let have_newer = match t.cmp(&event.created_at) {
                             std::cmp::Ordering::Less => false,
                             std::cmp::Ordering::Equal => {
-                                let e = &self.n_to_event_get(n).unwrap();
-                                e.id > event.id
+                                self.n_to_event_get(n).map_or(false, |e| e.id > event.id)
                             }
                             std::cmp::Ordering::Greater => true,
                         };
@@ -322,7 +321,9 @@ impl Db {
                                 self.hash_to_n_set_deletion_requested(a, n, &deletion_requested_by);
                             }
                             HashToNEntry::Have => {
-                                let e = self.n_to_event_get(n).unwrap();
+                                let Some(e) = self.n_to_event_get(n) else {
+                                    continue;
+                                };
                                 if event.pubkey == e.pubkey {
                                     self.remove_event(n, HashStatus::Deleted);
                                 } else {
@@ -409,7 +410,9 @@ impl Db {
                 ]),
             };
             while let Some(Time(t, n)) = i.next(self) {
-                let e = self.n_to_event_get(n).unwrap();
+                let Some(e) = self.n_to_event_get(n) else {
+                    continue;
+                };
                 if first_d_value(&e).map_or(false, |d| d == d_value) {
                     let have_newer = match t.cmp(&earlier_than) {
                         std::cmp::Ordering::Less => false,
@@ -435,7 +438,6 @@ impl Db {
         let Some(event) = self.n_to_event_get(n) else {
             return;
         };
-        self.n_to_event_remove(n);
         self.hash_to_n_set_status(event.id.as_byte_array(), n, status);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
             let value = FirstTagValueCompact::new(value, self);
@@ -460,6 +462,7 @@ impl Db {
             ))
             .unwrap();
         self.time_remove(Time(event.created_at, n));
+        self.n_to_event_remove(n);
     }
 }
 
