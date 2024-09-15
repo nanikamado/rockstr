@@ -100,7 +100,8 @@ pub struct Event {
     pub kind: u32,
     pub tags: Vec<Tag>,
     pub content: String,
-    pub sig: Signature,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig: Option<Signature>,
 }
 
 #[derive(Debug)]
@@ -223,8 +224,10 @@ impl Event {
     }
 
     pub fn verify_sig(&self) -> bool {
-        self.sig
-            .verify(&Message::from_digest(*self.id.0.as_ref()), &self.pubkey.0)
+        let Some(sig) = self.sig else {
+            return false;
+        };
+        sig.verify(&Message::from_digest(*self.id.0.as_ref()), &self.pubkey.0)
             .is_ok()
     }
 }

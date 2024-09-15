@@ -414,6 +414,23 @@ async fn handle_event(
     use axum::extract::ws::Message;
     let id = event.id;
     let mut expiration = None;
+    fn check_sig(cs: &mut ConnectionState, event: &Event) -> Result<(), &'static str> {
+        if event.sig.is_some() {
+            if event.verify_sig() {
+                Ok(())
+            } else {
+                Err("invalid: bad signature")
+            }
+        } else if let Some(a) = cs.authed_pubkey {
+            if a == event.pubkey {
+                Ok(())
+            } else {
+                Err("invalid: authenticate with the same pubkey as the pubkey of rumor")
+            }
+        } else {
+            Err("invalid: auth is required to publish rumor")
+        }
+    }
     let (accepted, message): (_, Cow<str>) = if event_len > state.config.max_message_length {
         (false, "invalid: too large event".into())
     } else if state.config.banned_pubkeys.contains(&event.pubkey) {
@@ -421,8 +438,8 @@ async fn handle_event(
         (false, "blocked".into())
     } else if !event.verify_hash() {
         (false, "invalid: bad event id".into())
-    } else if !event.verify_sig() {
-        (false, "invalid: bad signature".into())
+    } else if let Err(e) = check_sig(cs, &event) {
+        (false, e.into())
     } else if event.created_at > now + state.config.created_at_upper_limit {
         (false, "invalid: created_at too early".into())
     } else if is_auth {

@@ -55,7 +55,7 @@ impl EventBuilder {
             kind: self.kind,
             tags: self.tags,
             content: self.content,
-            sig,
+            sig: Some(sig),
         }
     }
 }
