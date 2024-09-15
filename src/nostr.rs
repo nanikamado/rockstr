@@ -15,9 +15,16 @@ pub enum FirstTagValueCompact {
 }
 
 impl FirstTagValueCompact {
-    pub fn new(v: &FirstTagValue, db: &mut Db) -> Self {
+    pub fn new(v: &FirstTagValue, db: &Db) -> Option<Self> {
+        Some(match v {
+            FirstTagValue::Hex32(a) => Self::Hex32(db.get_n_from_hash(a)?),
+            FirstTagValue::String(a) => Self::String(a.clone()),
+        })
+    }
+
+    pub fn new_mut(v: &FirstTagValue, db: &mut Db) -> Self {
         match v {
-            FirstTagValue::Hex32(a) => Self::Hex32(db.get_n_from_hash(a)),
+            FirstTagValue::Hex32(a) => Self::Hex32(db.get_n_from_hash_or_create(a)),
             FirstTagValue::String(a) => Self::String(a.clone()),
         }
     }
@@ -36,12 +43,14 @@ pub struct FilterCompact {
 }
 
 impl FilterCompact {
-    pub fn new(f: &Filter, db: &mut Db) -> Self {
+    pub fn new(f: &Filter, db: &Db) -> Self {
         let mut new_conditions = Vec::with_capacity(f.conditions.len());
         for (priority, cs) in &f.conditions {
             new_conditions.push((
                 *priority,
-                cs.iter().map(|c| ConditionCompact::new(c, db)).collect(),
+                cs.iter()
+                    .flat_map(|c| ConditionCompact::new(c, db))
+                    .collect(),
             ));
         }
         Self {
@@ -95,14 +104,14 @@ impl ConditionCompact {
         buff
     }
 
-    pub fn new(c: &Condition, db: &mut Db) -> ConditionCompact {
-        match c {
-            Condition::Tag(k, v) => ConditionCompact::Tag(*k, FirstTagValueCompact::new(v, db)),
+    pub fn new(c: &Condition, db: &Db) -> Option<ConditionCompact> {
+        Some(match c {
+            Condition::Tag(k, v) => ConditionCompact::Tag(*k, FirstTagValueCompact::new(v, db)?),
             Condition::Author(a) => {
-                let n = db.get_n_from_hash(&a.to_bytes());
+                let n = db.get_n_from_hash(&a.to_bytes())?;
                 ConditionCompact::Author(n)
             }
             Condition::Kind(a) => ConditionCompact::Kind(*a),
-        }
+        })
     }
 }

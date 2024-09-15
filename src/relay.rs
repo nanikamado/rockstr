@@ -233,7 +233,7 @@ impl Db {
         })
     }
 
-    pub fn get_n_from_hash(&mut self, hash: &[u8; 32]) -> u64 {
+    pub fn get_n_from_hash_or_create(&mut self, hash: &[u8; 32]) -> u64 {
         if let Some(n) = self.hash_to_n.get(hash).unwrap() {
             u64::from_be_bytes(n[..8].try_into().unwrap())
         } else {
@@ -243,8 +243,15 @@ impl Db {
         }
     }
 
+    pub fn get_n_from_hash(&self, hash: &[u8; 32]) -> Option<u64> {
+        self.hash_to_n
+            .get(hash)
+            .unwrap()
+            .map(|n| u64::from_be_bytes(n[..8].try_into().unwrap()))
+    }
+
     pub fn add_event(&mut self, event: Arc<Event>) -> Result<u64, AddEventError> {
-        let author = self.get_n_from_hash(&event.pubkey.to_bytes());
+        let author = self.get_n_from_hash_or_create(&event.pubkey.to_bytes());
         let n = self.get_n_for_new_event(author, &event.id)?;
         match event.kind {
             0 | 3 | 10000..20000 => {
@@ -286,7 +293,7 @@ impl Db {
             }
             30000..40000 => {
                 if let Some(d_value) = first_d_value(&event) {
-                    let pubkey = self.get_n_from_hash(&event.pubkey.to_bytes());
+                    let pubkey = self.get_n_from_hash_or_create(&event.pubkey.to_bytes());
                     self.remove_d_tagged_event(
                         event.created_at,
                         d_value,
@@ -343,7 +350,7 @@ impl Db {
                                 if let (Ok(kind), Ok(pubkey)) =
                                     (kind.parse::<u32>(), PubKey::from_str(pubkey))
                                 {
-                                    let pubkey = self.get_n_from_hash(&pubkey.to_bytes());
+                                    let pubkey = self.get_n_from_hash_or_create(&pubkey.to_bytes());
                                     let _ = self.remove_d_tagged_event(
                                         event.created_at,
                                         d_value,
@@ -361,12 +368,12 @@ impl Db {
         }
         let time = Time(event.created_at, n);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
-            let value = FirstTagValueCompact::new(value, self);
+            let value = FirstTagValueCompact::new_mut(value, self);
             self.conditions
                 .put(key_to_vec(&ConditionCompact::Tag(tag, value), time), [])
                 .unwrap();
         }
-        let pubkey = self.get_n_from_hash(&event.pubkey.to_bytes());
+        let pubkey = self.get_n_from_hash_or_create(&event.pubkey.to_bytes());
         self.conditions
             .put(key_to_vec(&ConditionCompact::Author(pubkey), time), [])
             .unwrap();
@@ -386,7 +393,9 @@ impl Db {
         author: u64,
         id: Option<&EventId>,
     ) -> Result<(), AddEventError> {
-        let d_value_compact = FirstTagValueCompact::new(d_value, self);
+        let Some(d_value_compact) = FirstTagValueCompact::new(d_value, self) else {
+            return Ok(());
+        };
         let author = ConditionCompact::Author(author);
         let kind = ConditionCompact::Kind(kind);
         let d_tag = ConditionCompact::Tag(b'd', d_value_compact);
@@ -440,15 +449,16 @@ impl Db {
         };
         self.hash_to_n_set_status(event.id.as_byte_array(), n, status);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
-            let value = FirstTagValueCompact::new(value, self);
-            self.conditions
-                .delete(key_to_vec(
-                    &ConditionCompact::Tag(tag, value),
-                    Time(event.created_at, n),
-                ))
-                .unwrap();
+            if let Some(value) = FirstTagValueCompact::new(value, self) {
+                self.conditions
+                    .delete(key_to_vec(
+                        &ConditionCompact::Tag(tag, value),
+                        Time(event.created_at, n),
+                    ))
+                    .unwrap();
+            }
         }
-        let pubkey = self.get_n_from_hash(&event.pubkey.to_bytes());
+        let pubkey = self.get_n_from_hash_or_create(&event.pubkey.to_bytes());
         self.conditions
             .delete(key_to_vec(
                 &ConditionCompact::Author(pubkey),

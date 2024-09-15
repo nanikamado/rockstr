@@ -307,8 +307,8 @@ async fn handle_message(
                         debug!("req with {s}");
                         'filters_loop: for f in &filters {
                             let f = {
-                                let mut db = state.db.write();
-                                FilterCompact::new(f, &mut db)
+                                let db = state.db.read();
+                                FilterCompact::new(f, &db)
                             };
                             let mut limit = f.limit;
                             if let Some(ids) = f.ids {
