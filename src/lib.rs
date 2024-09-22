@@ -19,7 +19,7 @@ use display_as_json::AsJson;
 pub use error::Error;
 use hex_conservative::DisplayHex;
 use itertools::Itertools;
-use lnostr::kinds;
+use lnostr::{kinds, EventId};
 use log::{debug, info, warn};
 use nostr::{ClientMessage, Event, Filter, FilterCompact, FirstTagValue, PubKey, Tag};
 pub use plugin::PluginState;
@@ -56,6 +56,8 @@ pub struct Config {
     db_dir: String,
     #[serde(default)]
     pub plugin: String,
+    #[serde(default)]
+    block_note_without_profile: bool,
 }
 
 fn max_message_length_default() -> usize {
@@ -501,8 +503,23 @@ async fn handle_event(
             (true, "".into())
         }
     } else {
-        let r = if cs.authed_pubkey == state.config.admin_pubkey {
+        let r = if cs.authed_pubkey == state.config.admin_pubkey || leading_zeros(event.id) >= 25 {
             Ok(())
+        } else if state.config.block_note_without_profile
+            && [1, 3].contains(&event.kind)
+            && !state.db.have_kind_0(event.pubkey)
+        {
+            info!(
+                "blocked: {}\t{}\t{}",
+                cs.source_info.addr,
+                cs.source_info.user_agent,
+                serde_json::to_string(&event).unwrap()
+            );
+            Err(format!(
+                "blocked: publish your kind 0 event to this relay before publishing kind {}",
+                event.kind
+            )
+            .into())
         } else if let Some(p) = &state.plugin {
             p.check_event(event.clone(), cs.source_info.clone())
                 .await
@@ -566,6 +583,17 @@ async fn handle_event(
     Ok(())
 }
 
+pub fn leading_zeros(s: EventId) -> u32 {
+    let mut zeros = 0;
+    for &n in s.as_byte_array() {
+        zeros += n.leading_zeros();
+        if n != 0 {
+            break;
+        }
+    }
+    zeros
+}
+
 fn verify_auth(
     relay_name_for_auth: &str,
     cs: &ConnectionState,
@@ -596,4 +624,42 @@ fn verify_auth(
 async fn handler_404(uri: axum::http::Uri) -> Error {
     info!("handler_404: {uri}");
     Error::NotFound
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::leading_zeros;
+    use lnostr::EventId;
+    use std::str::FromStr;
+
+    #[test]
+    fn lz() {
+        assert_eq!(
+            leading_zeros(
+                EventId::from_str(
+                    "0002158589aa52e00f5b332a1871e89aacbb414ef1a4f95753583c48e501114e"
+                )
+                .unwrap()
+            ),
+            14
+        );
+        assert_eq!(
+            leading_zeros(
+                EventId::from_str(
+                    "00000affbc006bf45bdde66e92897d73f740a37eb5f94d65a029f76bf4ad4702"
+                )
+                .unwrap()
+            ),
+            20
+        );
+        assert_eq!(
+            leading_zeros(
+                EventId::from_str(
+                    "000000000e9d97a1ab09fc381030b346cdd7a142ad57e6df0b46dc9bef6c7e2d"
+                )
+                .unwrap()
+            ),
+            36
+        );
+    }
 }

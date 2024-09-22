@@ -91,7 +91,6 @@ pub struct Db {
     pub conditions: Rocks,
     /// [Time] -> []
     pub time: Rocks,
-    // pub blocked_pubkeys: FxHashSet<PubKey>,
 }
 
 impl Db {
@@ -395,6 +394,28 @@ impl Db {
         self.time_insert(time);
         self.n_to_event_insert(n, &event);
         Ok(n)
+    }
+
+    pub fn have_kind_0(&self, author: PubKey) -> bool {
+        let Some(n) = self.get_n_from_hash(&author.to_bytes()) else {
+            return false;
+        };
+        let author = ConditionCompact::Author(n);
+        let kind = ConditionCompact::Kind(0);
+        let mut i = GetEvents {
+            until: Time(u64::MAX, u64::MAX),
+            and_conditions: PriorityQueue::from([
+                (
+                    OrderedFloat(100.),
+                    ConditionsWithLatest::new(vec![author], self, 0),
+                ),
+                (
+                    OrderedFloat(0.),
+                    ConditionsWithLatest::new(vec![kind], self, 1),
+                ),
+            ]),
+        };
+        i.next(self).is_some()
     }
 
     fn remove_d_tagged_event(
