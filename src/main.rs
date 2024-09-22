@@ -1,6 +1,5 @@
 use expiration_queue::wait_expiration;
 use itertools::Itertools;
-use parking_lot::RwLock;
 use rockstr::{expiration_queue, listen, AppState, Config, Db, Error, PluginState};
 use std::env;
 use std::fs::File;
@@ -29,7 +28,7 @@ async fn main() -> Result<(), Error> {
         Some(PluginState::new(config.plugin.clone()))
     };
     let state = Arc::new(AppState {
-        db: RwLock::new(db),
+        db,
         broadcast_sender,
         event_expiration_sender,
         config,

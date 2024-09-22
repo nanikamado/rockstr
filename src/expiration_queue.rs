@@ -48,14 +48,13 @@ fn first(queue: &Rocks) -> Option<Box<[u8]>> {
 
 fn delete_expired_events(state: &AppState, queue_db: &Rocks) {
     let now = Instant::now();
-    let mut db = state.db.write();
     while let Some(s) = first(queue_db) {
         let t = Time::from_slice(&s);
         if unix_to_instant(t.0) > now {
             break;
         }
         queue_db.delete(s).unwrap();
-        db.remove_event(t.1, HashStatus::Unknown);
+        state.db.remove_event(t.1, HashStatus::Unknown);
     }
 }
 

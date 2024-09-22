@@ -22,3 +22,4 @@ toml = "0.8.19"
 lnostr = { path = "crates/lnostr" }
 hex-conservative = "0.2.1"
 cached = { version="0.53.1", default-features = false }
+bitcoin_hashes = { version = "0.14.0", features = ["serde"] }

@@ -14,6 +14,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use bitcoin_hashes::{sha256, Hash};
 use display_as_json::AsJson;
 pub use error::Error;
 use hex_conservative::DisplayHex;
@@ -21,7 +22,6 @@ use itertools::Itertools;
 use lnostr::kinds;
 use log::{debug, info, warn};
 use nostr::{ClientMessage, Event, Filter, FilterCompact, FirstTagValue, PubKey, Tag};
-use parking_lot::RwLock;
 pub use plugin::PluginState;
 use rand::RngCore;
 pub use relay::{AddEventError, Db, GetEvents, GetEventsStopped, Time};
@@ -31,7 +31,8 @@ use serde_json::json;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::env;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,7 +76,7 @@ fn relay_name_default() -> String {
 
 #[derive(Debug)]
 pub struct AppState {
-    pub db: RwLock<Db>,
+    pub db: Db,
     pub broadcast_sender: tokio::sync::broadcast::Sender<Arc<Event>>,
     pub event_expiration_sender: tokio::sync::mpsc::Sender<Time>,
     pub config: Config,
@@ -131,6 +132,7 @@ pub async fn root(
                             .unwrap_or_default(),
                     }
                     .into(),
+                    req_count: 0,
                 };
                 let a = ws_handler(state, &mut cs).await;
                 debug!("ws close: {a:?}");
@@ -195,6 +197,7 @@ struct ConnectionState {
     authed_pubkey: Option<PubKey>,
     credit: u32,
     source_info: Arc<SourceInfo>,
+    req_count: u64,
 }
 
 async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<CloseReason, Error> {
@@ -304,18 +307,55 @@ async fn handle_message(
                         None
                     }
                     ClientMessage::Req { id, filters } => {
-                        debug!("req with {s}");
+                        struct LineLimit<'a>(&'a str);
+                        impl Display for LineLimit<'_> {
+                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                                if self.0.len() > 3000 {
+                                    write!(f, "{} ... ({} bytes)", &self.0[..3000], self.0.len())
+                                } else {
+                                    write!(f, "{}", self.0)
+                                }
+                            }
+                        }
+                        enum DisplayIfSome<S: Display> {
+                            Some(S),
+                            None,
+                        }
+                        impl<S: Display> Display for DisplayIfSome<S> {
+                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                                match &self {
+                                    DisplayIfSome::Some(a) => write!(f, "{a}"),
+                                    DisplayIfSome::None => Ok(()),
+                                }
+                            }
+                        }
+                        debug!(
+                            "[{}] req with {}{}",
+                            cs.req_count,
+                            LineLimit(&s),
+                            if cs.req_count > 100
+                                && !(cs.authed_pubkey.is_some()
+                                    && cs.authed_pubkey == state.config.admin_pubkey)
+                            {
+                                let mut h = sha256::HashEngine::default();
+                                h.write_all(s.as_bytes()).unwrap();
+                                DisplayIfSome::Some(format!(
+                                    " {:x} {:?}",
+                                    sha256::Hash::from_engine(h),
+                                    cs.source_info
+                                ))
+                            } else {
+                                DisplayIfSome::None
+                            }
+                        );
+                        cs.req_count += 1;
                         'filters_loop: for f in &filters {
-                            let f = {
-                                let db = state.db.read();
-                                FilterCompact::new(f, &db)
-                            };
+                            let f = FilterCompact::new(f, &state.db);
                             let mut limit = f.limit;
                             if let Some(ids) = f.ids {
                                 let es = {
-                                    let db = state.db.read();
                                     ids.into_iter()
-                                        .filter_map(|id| db.n_to_event_get(id))
+                                        .filter_map(|id| state.db.n_to_event_get(id))
                                         .sorted_by_key(|e| (e.created_at, e.id))
                                         .take(limit as usize)
                                 };
@@ -333,22 +373,22 @@ async fn handle_message(
                                 loop {
                                     let mut ms = Vec::with_capacity(100);
                                     continuation = {
-                                        let db = state.db.read();
+                                        let db = &state.db;
                                         let mut s = match continuation {
                                             St::Init => {
-                                                let Some(s) = GetEvents::new(&f, &db) else {
+                                                let Some(s) = GetEvents::new(&f, db) else {
                                                     continue 'filters_loop;
                                                 };
                                                 s
                                             }
-                                            St::Middle(s) => s.restart(&db),
+                                            St::Middle(s) => s.restart(db),
                                             St::End => panic!(),
                                         };
                                         loop {
                                             if limit == 0 {
                                                 break St::End;
                                             }
-                                            let Some(Time(t, n)) = s.next(&db) else {
+                                            let Some(Time(t, n)) = s.next(db) else {
                                                 break St::End;
                                             };
                                             if t < f.since {
@@ -491,8 +531,7 @@ async fn handle_event(
                     (false, "auth-required: event marked as protected".into())
                 }
             } else {
-                let mut db = state.db.write();
-                match db.add_event(event.clone()) {
+                match state.db.add_event(event.clone()) {
                     Ok(n) => {
                         let _ = state.broadcast_sender.send(event);
                         if let Some(e) = ex {

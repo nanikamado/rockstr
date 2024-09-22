@@ -12,7 +12,8 @@ use std::fs::create_dir_all;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{atomic, Arc};
 
 type UnixTime = u64;
 
@@ -60,8 +61,21 @@ impl HashToNEntry {
 }
 
 #[derive(Debug)]
+pub struct Counter(AtomicU64);
+
+impl Counter {
+    fn new(next: u64) -> Self {
+        Counter(AtomicU64::new(next))
+    }
+
+    fn next(&self) -> u64 {
+        self.0.fetch_add(1, atomic::Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug)]
 pub struct Db {
-    pub n_count: u64,
+    pub n_count: Counter,
     /// [u64] -> event json
     n_to_event: Rocks,
     /// one of the following format:
@@ -96,7 +110,7 @@ impl Db {
             1
         };
         Self {
-            n_count: next_n,
+            n_count: Counter::new(next_n),
             n_to_event,
             hash_to_n,
             conditions,
@@ -196,7 +210,7 @@ impl Db {
         self.hash_to_n.put(hash, value).unwrap();
     }
 
-    pub fn get_n_for_new_event(&mut self, author: u64, id: &EventId) -> Result<u64, AddEventError> {
+    pub fn get_n_for_new_event(&self, author: u64, id: &EventId) -> Result<u64, AddEventError> {
         let id = id.as_byte_array();
         let n = if let Some(v) = self.hash_to_n.get(id).unwrap() {
             match HashToNEntry::from_bytes(&v) {
@@ -216,8 +230,7 @@ impl Db {
             }
         } else {
             // we do not know this id
-            self.n_count += 1;
-            self.n_count
+            self.n_count.next()
         };
         self.hash_to_n_set_have(id, n);
         Ok(n)
@@ -233,13 +246,13 @@ impl Db {
         })
     }
 
-    pub fn get_n_from_hash_or_create(&mut self, hash: &[u8; 32]) -> u64 {
+    pub fn get_n_from_hash_or_create(&self, hash: &[u8; 32]) -> u64 {
         if let Some(n) = self.hash_to_n.get(hash).unwrap() {
             u64::from_be_bytes(n[..8].try_into().unwrap())
         } else {
-            self.n_count += 1;
-            self.hash_to_n_set_unknown(hash, self.n_count);
-            self.n_count
+            let n = self.n_count.next();
+            self.hash_to_n_set_unknown(hash, n);
+            n
         }
     }
 
@@ -250,7 +263,7 @@ impl Db {
             .map(|n| u64::from_be_bytes(n[..8].try_into().unwrap()))
     }
 
-    pub fn add_event(&mut self, event: Arc<Event>) -> Result<u64, AddEventError> {
+    pub fn add_event(&self, event: Arc<Event>) -> Result<u64, AddEventError> {
         let author = self.get_n_from_hash_or_create(&event.pubkey.to_bytes());
         let n = self.get_n_for_new_event(author, &event.id)?;
         match event.kind {
@@ -309,8 +322,7 @@ impl Db {
                         let (n, e) = if let Some(a) = self.hash_to_n_get(a) {
                             a
                         } else {
-                            self.n_count += 1;
-                            let n = self.n_count;
+                            let n = self.n_count.next();
                             (
                                 n,
                                 HashToNEntry::Unknown {
@@ -368,7 +380,7 @@ impl Db {
         }
         let time = Time(event.created_at, n);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
-            let value = FirstTagValueCompact::new_mut(value, self);
+            let value = FirstTagValueCompact::new_with_new_n(value, self);
             self.conditions
                 .put(key_to_vec(&ConditionCompact::Tag(tag, value), time), [])
                 .unwrap();
@@ -386,7 +398,7 @@ impl Db {
     }
 
     fn remove_d_tagged_event(
-        &mut self,
+        &self,
         earlier_than: u64,
         d_value: &FirstTagValue,
         kind: u32,
@@ -443,7 +455,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn remove_event(&mut self, n: u64, status: HashStatus) {
+    pub fn remove_event(&self, n: u64, status: HashStatus) {
         let Some(event) = self.n_to_event_get(n) else {
             return;
         };

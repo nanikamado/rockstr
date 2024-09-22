@@ -1046,6 +1046,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bitcoin_hashes",
  "cached",
  "env_logger",
  "hex-conservative",

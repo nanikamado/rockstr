@@ -22,7 +22,7 @@ impl FirstTagValueCompact {
         })
     }
 
-    pub fn new_mut(v: &FirstTagValue, db: &mut Db) -> Self {
+    pub fn new_with_new_n(v: &FirstTagValue, db: &Db) -> Self {
         match v {
             FirstTagValue::Hex32(a) => Self::Hex32(db.get_n_from_hash_or_create(a)),
             FirstTagValue::String(a) => Self::String(a.clone()),
