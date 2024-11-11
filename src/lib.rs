@@ -569,8 +569,6 @@ async fn handle_event(
     };
     if accepted {
         cs.credit = DEFAULT_CREDIT;
-    } else {
-        cs.credit = cs.credit.saturating_sub(1);
     }
     cs.ws
         .send(Message::Text(format!(
