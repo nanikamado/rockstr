@@ -114,7 +114,6 @@ impl Db {
             hash_to_n,
             conditions,
             time,
-            // blocked_pubkeys: Default::default(),
         }
     }
 }
