@@ -377,6 +377,7 @@ impl Db {
             _ => (),
         }
         let time = Time(event.created_at, n);
+        self.n_to_event_insert(n, &event);
         for (tag, value) in SingleLetterTags::new(&event.tags) {
             let value = FirstTagValueCompact::new_with_new_n(value, self);
             self.conditions
@@ -391,7 +392,6 @@ impl Db {
             .put(key_to_vec(&ConditionCompact::Kind(event.kind), time), [])
             .unwrap();
         self.time_insert(time);
-        self.n_to_event_insert(n, &event);
         Ok(n)
     }
 
