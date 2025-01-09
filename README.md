@@ -1,3 +1,3 @@
-# Momostr
+# Rockstr
 
-An experimental Nostr relay.
+A simple Nostr relay using RocksDB.
