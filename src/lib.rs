@@ -282,6 +282,13 @@ fn important_tags(e: &Event) -> (Option<u64>, bool) {
     (expiration, protected)
 }
 
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 async fn handle_message(
     state: &Arc<AppState>,
     cs: &mut ConnectionState,
@@ -290,145 +297,139 @@ async fn handle_message(
     use axum::extract::ws::Message;
     let continue_ = match m {
         Message::Text(s) => match serde_json::from_str(&s) {
-            Ok(m) => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                match m {
-                    ClientMessage::Event(e) => {
-                        handle_event(state, cs, e, s.len(), now, false).await?;
-                        if cs.credit == 0 {
-                            Some(CloseReason::MaliciousConnection)
-                        } else {
-                            None
-                        }
-                    }
-                    ClientMessage::Auth(e) => {
-                        handle_event(state, cs, e, s.len(), now, true).await?;
-                        None
-                    }
-                    ClientMessage::Req { id, filters } => {
-                        struct LineLimit<'a>(&'a str);
-                        impl Display for LineLimit<'_> {
-                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                                if self.0.len() > 3000 {
-                                    write!(f, "{} ... ({} bytes)", &self.0[..3000], self.0.len())
-                                } else {
-                                    write!(f, "{}", self.0)
-                                }
-                            }
-                        }
-                        enum DisplayIfSome<S: Display> {
-                            Some(S),
-                            None,
-                        }
-                        impl<S: Display> Display for DisplayIfSome<S> {
-                            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                                match &self {
-                                    DisplayIfSome::Some(a) => write!(f, "{a}"),
-                                    DisplayIfSome::None => Ok(()),
-                                }
-                            }
-                        }
-                        debug!(
-                            "[{}] req with {}{}",
-                            cs.req_count,
-                            LineLimit(&s),
-                            if cs.req_count > 100
-                                && !(cs.authed_pubkey.is_some()
-                                    && cs.authed_pubkey == state.config.admin_pubkey)
-                            {
-                                let mut h = sha256::HashEngine::default();
-                                h.write_all(s.as_bytes()).unwrap();
-                                DisplayIfSome::Some(format!(
-                                    " {:x} {:?}",
-                                    sha256::Hash::from_engine(h),
-                                    cs.source_info
-                                ))
-                            } else {
-                                DisplayIfSome::None
-                            }
-                        );
-                        cs.req_count += 1;
-                        'filters_loop: for f in &filters {
-                            let f = FilterCompact::new(f, &state.db);
-                            let mut limit = f.limit;
-                            if let Some(ids) = f.ids {
-                                let es = {
-                                    ids.into_iter()
-                                        .filter_map(|id| state.db.n_to_event_get(id))
-                                        .sorted_by_key(|e| (e.created_at, e.id))
-                                        .take(limit as usize)
-                                };
-                                for e in es {
-                                    let m = Message::Text(event_message(&id, &e));
-                                    cs.ws.send(m).await?;
-                                }
-                            } else {
-                                enum St {
-                                    Init,
-                                    Middle(GetEventsStopped),
-                                    End,
-                                }
-                                let mut continuation = St::Init;
-                                loop {
-                                    let mut ms = Vec::with_capacity(100);
-                                    continuation = {
-                                        let db = &state.db;
-                                        let mut s = match continuation {
-                                            St::Init => {
-                                                let Some(s) = GetEvents::new(&f, db) else {
-                                                    continue 'filters_loop;
-                                                };
-                                                s
-                                            }
-                                            St::Middle(s) => s.restart(db),
-                                            St::End => panic!(),
-                                        };
-                                        loop {
-                                            if limit == 0 {
-                                                break St::End;
-                                            }
-                                            let Some(Time(t, n)) = s.next(db) else {
-                                                break St::End;
-                                            };
-                                            if t < f.since {
-                                                break St::End;
-                                            }
-                                            let Some(e) = db.n_to_event_get(n) else {
-                                                continue;
-                                            };
-                                            let m = Message::Text(event_message(&id, &e));
-                                            limit -= 1;
-                                            ms.push(m);
-                                            if ms.len() >= 100 {
-                                                break St::Middle(s.stop());
-                                            }
-                                        }
-                                    };
-                                    for m in ms {
-                                        cs.ws.send(m).await?;
-                                    }
-                                    if matches!(continuation, St::End) {
-                                        continue 'filters_loop;
-                                    }
-                                }
-                            }
-                        }
-                        cs.ws
-                            .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
-                            .await?;
-                        cs.req.insert(id, filters);
-                        None
-                    }
-                    ClientMessage::Close(id) => {
-                        debug!("close {id}");
-                        cs.req.remove(id.as_ref());
+            Ok(m) => match m {
+                ClientMessage::Event(e) => {
+                    handle_event(state, cs, e, s.len(), now_unix(), false).await?;
+                    if cs.credit == 0 {
+                        Some(CloseReason::MaliciousConnection)
+                    } else {
                         None
                     }
                 }
-            }
+                ClientMessage::Auth(e) => {
+                    handle_event(state, cs, e, s.len(), now_unix(), true).await?;
+                    None
+                }
+                ClientMessage::Req { id, filters } => {
+                    struct LineLimit<'a>(&'a str);
+                    impl Display for LineLimit<'_> {
+                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            if self.0.len() > 3000 {
+                                write!(f, "{} ... ({} bytes)", &self.0[..3000], self.0.len())
+                            } else {
+                                write!(f, "{}", self.0)
+                            }
+                        }
+                    }
+                    enum DisplayIfSome<S: Display> {
+                        Some(S),
+                        None,
+                    }
+                    impl<S: Display> Display for DisplayIfSome<S> {
+                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                            match &self {
+                                DisplayIfSome::Some(a) => write!(f, "{a}"),
+                                DisplayIfSome::None => Ok(()),
+                            }
+                        }
+                    }
+                    debug!(
+                        "[{}] req with {}{}",
+                        cs.req_count,
+                        LineLimit(&s),
+                        if cs.req_count > 100
+                            && !(cs.authed_pubkey.is_some()
+                                && cs.authed_pubkey == state.config.admin_pubkey)
+                        {
+                            let mut h = sha256::HashEngine::default();
+                            h.write_all(s.as_bytes()).unwrap();
+                            DisplayIfSome::Some(format!(
+                                " {:x} {:?}",
+                                sha256::Hash::from_engine(h),
+                                cs.source_info
+                            ))
+                        } else {
+                            DisplayIfSome::None
+                        }
+                    );
+                    cs.req_count += 1;
+                    'filters_loop: for f in &filters {
+                        let f = FilterCompact::new(f, &state.db);
+                        let mut limit = f.limit;
+                        if let Some(ids) = f.ids {
+                            let es = {
+                                ids.into_iter()
+                                    .filter_map(|id| state.db.n_to_event_get(id))
+                                    .sorted_by_key(|e| (e.created_at, e.id))
+                                    .take(limit as usize)
+                            };
+                            for e in es {
+                                let m = Message::Text(event_message(&id, &e));
+                                cs.ws.send(m).await?;
+                            }
+                        } else {
+                            enum St {
+                                Init,
+                                Middle(GetEventsStopped),
+                                End,
+                            }
+                            let mut continuation = St::Init;
+                            loop {
+                                let mut ms = Vec::with_capacity(100);
+                                continuation = {
+                                    let db = &state.db;
+                                    let mut s = match continuation {
+                                        St::Init => {
+                                            let Some(s) = GetEvents::new(&f, db) else {
+                                                continue 'filters_loop;
+                                            };
+                                            s
+                                        }
+                                        St::Middle(s) => s.restart(db),
+                                        St::End => panic!(),
+                                    };
+                                    loop {
+                                        if limit == 0 {
+                                            break St::End;
+                                        }
+                                        let Some(Time(t, n)) = s.next(db) else {
+                                            break St::End;
+                                        };
+                                        if t < f.since {
+                                            break St::End;
+                                        }
+                                        let Some(e) = db.n_to_event_get(n) else {
+                                            continue;
+                                        };
+                                        let m = Message::Text(event_message(&id, &e));
+                                        limit -= 1;
+                                        ms.push(m);
+                                        if ms.len() >= 100 {
+                                            break St::Middle(s.stop());
+                                        }
+                                    }
+                                };
+                                for m in ms {
+                                    cs.ws.send(m).await?;
+                                }
+                                if matches!(continuation, St::End) {
+                                    continue 'filters_loop;
+                                }
+                            }
+                        }
+                    }
+                    cs.ws
+                        .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
+                        .await?;
+                    cs.req.insert(id, filters);
+                    None
+                }
+                ClientMessage::Close(id) => {
+                    debug!("close {id}");
+                    cs.req.remove(id.as_ref());
+                    None
+                }
+            },
             Err(e) => {
                 warn!("parse error: {e}, text = {s:?}");
                 return Ok(None);
