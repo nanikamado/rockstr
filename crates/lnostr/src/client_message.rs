@@ -1,5 +1,5 @@
 use crate::{Event, Filter};
-use serde::de::Visitor;
+use serde::de::{IgnoredAny, Visitor};
 use serde::{de, Deserialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -59,8 +59,16 @@ impl<'a> Visitor<'a> for ClientMessageVisitor {
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
                 let mut filters = SmallVec::with_capacity(seq.size_hint().unwrap_or_default());
+                #[derive(Deserialize, Clone, Debug, PartialEq)]
+                #[serde(untagged)]
+                pub enum OrError<T> {
+                    Some(T),
+                    None(IgnoredAny),
+                }
                 while let Some(a) = seq.next_element()? {
-                    filters.push(a);
+                    if let OrError::Some(a) = a {
+                        filters.push(a);
+                    }
                 }
                 Ok(ClientMessage::Req { id, filters })
             }
@@ -72,5 +80,22 @@ impl<'a> Visitor<'a> for ClientMessageVisitor {
             }
             _ => Err(de::Error::custom(format!("Unknown Message: {tag}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn req_parse() {
+        let req = r#"["REQ","test",{"authors":["aaaa"],"limit":1},{"limit":2}]"#;
+        let m: ClientMessage = serde_json::from_str(req).unwrap();
+        let ClientMessage::Req { id, filters } = m else {
+            panic!()
+        };
+        assert_eq!(id, "test");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].limit, 2);
     }
 }
