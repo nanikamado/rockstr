@@ -287,7 +287,7 @@ impl Db {
                         let have_newer = match t.cmp(&event.created_at) {
                             std::cmp::Ordering::Less => false,
                             std::cmp::Ordering::Equal => {
-                                self.n_to_event_get(n).map_or(false, |e| e.id > event.id)
+                                self.n_to_event_get(n).is_some_and(|e| e.id > event.id)
                             }
                             std::cmp::Ordering::Greater => true,
                         };
@@ -454,10 +454,10 @@ impl Db {
                 let Some(e) = self.n_to_event_get(n) else {
                     continue;
                 };
-                if first_d_value(&e).map_or(false, |d| d == d_value) {
+                if first_d_value(&e).is_some_and(|d| d == d_value) {
                     let have_newer = match t.cmp(&earlier_than) {
                         std::cmp::Ordering::Less => false,
-                        std::cmp::Ordering::Equal => id.map_or(false, |id| &e.id > id),
+                        std::cmp::Ordering::Equal => id.is_some_and(|id| &e.id > id),
                         std::cmp::Ordering::Greater => true,
                     };
                     if have_newer {

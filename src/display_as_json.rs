@@ -13,7 +13,7 @@ impl<A: Serialize> Display for AsJson<A> {
             inner: &'a mut fmt::Formatter<'b>,
         }
 
-        impl<'a, 'b> io::Write for WriterFormatter<'a, 'b> {
+        impl io::Write for WriterFormatter<'_, '_> {
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 // Safety: the serializer below only emits valid utf8 when using
                 // the default formatter.

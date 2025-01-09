@@ -114,14 +114,11 @@ impl Serialize for Tag {
     {
         let mut s = serializer.serialize_seq(None)?;
         s.serialize_element(&self.0)?;
-        match &self.1 {
-            Some((t, ts)) => {
+        if let Some((t, ts)) = &self.1 {
+            s.serialize_element(t)?;
+            for t in ts {
                 s.serialize_element(t)?;
-                for t in ts {
-                    s.serialize_element(t)?;
-                }
             }
-            None => (),
         }
         s.end()
     }

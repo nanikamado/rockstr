@@ -147,7 +147,7 @@ pub async fn root(
             } else if headers
                 .get("accept")
                 .and_then(|a| a.to_str().ok())
-                .map_or(false, |a| a.contains("application/nostr+json"))
+                .is_some_and(|a| a.contains("application/nostr+json"))
             {
                 let mut r = json!({
                     "description": state.config.relay_description,
@@ -537,7 +537,7 @@ async fn handle_event(
             (true, "".into())
         } else {
             let (ex, protected) = important_tags(&event);
-            if ex.map_or(false, |e| e <= now) {
+            if ex.is_some_and(|e| e <= now) {
                 (false, "invalid: event expired".into())
             } else if protected
                 && cs.authed_pubkey != Some(event.pubkey)
