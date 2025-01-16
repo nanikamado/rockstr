@@ -153,7 +153,7 @@ pub async fn root(
                     "description": state.config.relay_description,
                     "name": state.config.relay_name,
                     "software": "git+https://github.com/nanikamado/rockstr.git",
-                    "supported_nips": [1, 9, 11, 40],
+                    "supported_nips": [1, 9, 11, 17, 40, 59],
                     "version": env!("CARGO_PKG_VERSION"),
                     "limitation": {
                         "max_message_length": state.config.max_message_length,
