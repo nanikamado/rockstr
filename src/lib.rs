@@ -243,15 +243,45 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
     Ok(r)
 }
 
+fn is_addressed_to(event: &Event, to: &PubKey) -> bool {
+    event.tags.iter().any(|a| {
+        if let lnostr::Tag(t, Some((FirstTagValue::Hex32(p), _))) = a {
+            t == "p" && &to.to_bytes() == p
+        } else {
+            false
+        }
+    })
+}
+
+async fn send_event(
+    ws: &mut WebSocket,
+    authed_pubkey: &Option<PubKey>,
+    req_id: &str,
+    event: &Event,
+) -> Result<(), Error> {
+    use axum::extract::ws::Message;
+    // To protect recipient metadata, relays SHOULD guard access to `kind 1059` events based on user AUTH
+    // https://github.com/nostr-protocol/nips/blob/3f11c00fb93f118f207130344032710e34de4710/59.md?plain=1#L93
+    if event.kind == kinds::GIFT_WRAP && authed_pubkey.is_none_or(|p| !is_addressed_to(event, &p)) {
+        return Ok(());
+    }
+    let m = Message::Text(format!(
+        r#"["EVENT",{},{}]"#,
+        AsJson(&req_id),
+        AsJson(event)
+    ));
+    Ok(ws.send(m).await?)
+}
+
 async fn receive_broadcast(
     cs: &mut ConnectionState,
     e: Result<Arc<Event>, tokio::sync::broadcast::error::RecvError>,
 ) {
     match e {
         Ok(e) => {
-            for (id, filters) in &cs.req {
+            for (req_id, filters) in &cs.req {
                 if filters.iter().any(|f| f.matches(&e)) {
-                    let _ = cs.ws.send(ws::Message::Text(event_message(id, &e))).await;
+                    let _ = send_event(&mut cs.ws, &cs.authed_pubkey, req_id, &e).await;
                 }
             }
         }
@@ -259,10 +289,6 @@ async fn receive_broadcast(
             log::error!("receive error: {e}")
         }
     }
-}
-
-fn event_message(id: &str, e: &Event) -> String {
-    format!(r#"["EVENT",{},{}]"#, AsJson(&id), AsJson(e))
 }
 
 fn important_tags(e: &Event) -> (Option<u64>, bool) {
@@ -310,7 +336,10 @@ async fn handle_message(
                     handle_event(state, cs, e, s.len(), now_unix(), true).await?;
                     None
                 }
-                ClientMessage::Req { id, filters } => {
+                ClientMessage::Req {
+                    id: req_id,
+                    filters,
+                } => {
                     struct LineLimit<'a>(&'a str);
                     impl Display for LineLimit<'_> {
                         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -364,8 +393,7 @@ async fn handle_message(
                                     .take(limit as usize)
                             };
                             for e in es {
-                                let m = Message::Text(event_message(&id, &e));
-                                cs.ws.send(m).await?;
+                                send_event(&mut cs.ws, &cs.authed_pubkey, &req_id, &e).await?;
                             }
                         } else {
                             enum St {
@@ -375,7 +403,7 @@ async fn handle_message(
                             }
                             let mut continuation = St::Init;
                             loop {
-                                let mut ms = Vec::with_capacity(100);
+                                let mut es = Vec::with_capacity(100);
                                 continuation = {
                                     let db = &state.db;
                                     let mut s = match continuation {
@@ -401,16 +429,15 @@ async fn handle_message(
                                         let Some(e) = db.n_to_event_get(n) else {
                                             continue;
                                         };
-                                        let m = Message::Text(event_message(&id, &e));
                                         limit -= 1;
-                                        ms.push(m);
-                                        if ms.len() >= 100 {
+                                        es.push(e);
+                                        if es.len() >= 100 {
                                             break St::Middle(s.stop());
                                         }
                                     }
                                 };
-                                for m in ms {
-                                    cs.ws.send(m).await?;
+                                for e in es {
+                                    send_event(&mut cs.ws, &cs.authed_pubkey, &req_id, &e).await?;
                                 }
                                 if matches!(continuation, St::End) {
                                     continue 'filters_loop;
@@ -419,9 +446,9 @@ async fn handle_message(
                         }
                     }
                     cs.ws
-                        .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&id))))
+                        .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&req_id))))
                         .await?;
-                    cs.req.insert(id, filters);
+                    cs.req.insert(req_id, filters);
                     None
                 }
                 ClientMessage::Close(id) => {
