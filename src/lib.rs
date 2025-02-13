@@ -495,10 +495,10 @@ async fn handle_event(
             if a == event.pubkey {
                 Ok(())
             } else {
-                Err("invalid: authenticate with the same pubkey as the pubkey of rumor")
+                Err("invalid: authenticate with the same pubkey as the pubkey of the rumor")
             }
         } else {
-            Err("invalid: auth is required to publish rumor")
+            Err("invalid: auth is required to publish a rumor")
         }
     }
     let (accepted, message): (_, Cow<str>) = if event_len > state.config.max_message_length {
