@@ -8,6 +8,9 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub enum ClientMessage<'a> {
     Event(Arc<Event>),
+    InvalidEvent {
+        id: String,
+    },
     Req {
         id: String,
         filters: SmallVec<[Filter; 2]>,
@@ -41,12 +44,25 @@ impl<'a> Visitor<'a> for ClientMessageVisitor {
         let tag: &str = seq
             .next_element()?
             .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        #[derive(Debug, Deserialize)]
+        pub struct InvalidEvent {
+            pub id: String,
+        }
+        #[derive(Deserialize, Clone, Debug, PartialEq)]
+        #[serde(untagged)]
+        pub enum ParseEither<A, B> {
+            First(A),
+            Second(B),
+        }
         match tag {
             "EVENT" => {
-                let e = seq
+                let e: ParseEither<Arc<Event>, InvalidEvent> = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                Ok(ClientMessage::Event(e))
+                match e {
+                    ParseEither::First(e) => Ok(ClientMessage::Event(e)),
+                    ParseEither::Second(e) => Ok(ClientMessage::InvalidEvent { id: e.id }),
+                }
             }
             "AUTH" => {
                 let e = seq
@@ -59,14 +75,8 @@ impl<'a> Visitor<'a> for ClientMessageVisitor {
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
                 let mut filters = SmallVec::with_capacity(seq.size_hint().unwrap_or_default());
-                #[derive(Deserialize, Clone, Debug, PartialEq)]
-                #[serde(untagged)]
-                pub enum OrError<T> {
-                    Some(T),
-                    None(IgnoredAny),
-                }
-                while let Some(a) = seq.next_element()? {
-                    if let OrError::Some(a) = a {
+                while let Some(a) = seq.next_element::<ParseEither<_, IgnoredAny>>()? {
+                    if let ParseEither::First(a) = a {
                         filters.push(a);
                     }
                 }

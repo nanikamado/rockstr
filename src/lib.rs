@@ -332,6 +332,14 @@ async fn handle_message(
                         None
                     }
                 }
+                ClientMessage::InvalidEvent { id } => {
+                    cs.ws
+                        .send(Message::Text(format!(
+                            r#"["OK","{id}",false,"could not parse event"]"#,
+                        )))
+                        .await?;
+                    None
+                }
                 ClientMessage::Auth(e) => {
                     handle_event(state, cs, e, s.len(), now_unix(), true).await?;
                     None
