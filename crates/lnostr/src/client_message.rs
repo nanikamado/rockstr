@@ -17,6 +17,7 @@ pub enum ClientMessage<'a> {
     },
     Close(Cow<'a, str>),
     Auth(Arc<Event>),
+    AcceptRumors(bool),
 }
 
 impl<'a> Deserialize<'a> for ClientMessage<'a> {
@@ -87,6 +88,12 @@ impl<'a> Visitor<'a> for ClientMessageVisitor {
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
                 Ok(ClientMessage::Close(id))
+            }
+            "ACCEPT_RUMORS" => {
+                let b = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                Ok(ClientMessage::AcceptRumors(b))
             }
             _ => Err(de::Error::custom(format!("Unknown Message: {tag}"))),
         }

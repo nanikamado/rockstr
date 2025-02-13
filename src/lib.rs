@@ -135,6 +135,8 @@ pub async fn root(
                     }
                     .into(),
                     req_count: 0,
+                    accept_rumors: false,
+                    publish_rumors: false,
                 };
                 let a = ws_handler(state, &mut cs).await;
                 debug!("ws close: {a:?}");
@@ -200,14 +202,15 @@ struct ConnectionState {
     credit: u32,
     source_info: Arc<SourceInfo>,
     req_count: u64,
+    /// if the client accepts rumors
+    accept_rumors: bool,
+    /// if the client publish rumors
+    publish_rumors: bool,
 }
 
 async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<CloseReason, Error> {
     cs.ws
-        .send(ws::Message::Text(format!(
-            r#"["AUTH", "{}"]"#,
-            cs.challenge
-        )))
+        .send(ws::Message::Text(format!(r#"["AUTH","{}"]"#, cs.challenge)))
         .await?;
     let mut waiting_for_pong = false;
     let r = loop {
@@ -256,6 +259,7 @@ fn is_addressed_to(event: &Event, to: &PubKey) -> bool {
 async fn send_event(
     ws: &mut WebSocket,
     authed_pubkey: &Option<PubKey>,
+    accept_rumors: bool,
     req_id: &str,
     event: &Event,
 ) -> Result<(), Error> {
@@ -263,6 +267,9 @@ async fn send_event(
     // To protect recipient metadata, relays SHOULD guard access to `kind 1059` events based on user AUTH
     // https://github.com/nostr-protocol/nips/blob/3f11c00fb93f118f207130344032710e34de4710/59.md?plain=1#L93
     if event.kind == kinds::GIFT_WRAP && authed_pubkey.is_none_or(|p| !is_addressed_to(event, &p)) {
+        return Ok(());
+    }
+    if event.sig.is_none() && !accept_rumors {
         return Ok(());
     }
     let m = Message::Text(format!(
@@ -281,7 +288,8 @@ async fn receive_broadcast(
         Ok(e) => {
             for (req_id, filters) in &cs.req {
                 if filters.iter().any(|f| f.matches(&e)) {
-                    let _ = send_event(&mut cs.ws, &cs.authed_pubkey, req_id, &e).await;
+                    let _ = send_event(&mut cs.ws, &cs.authed_pubkey, cs.accept_rumors, req_id, &e)
+                        .await;
                 }
             }
         }
@@ -401,7 +409,14 @@ async fn handle_message(
                                     .take(limit as usize)
                             };
                             for e in es {
-                                send_event(&mut cs.ws, &cs.authed_pubkey, &req_id, &e).await?;
+                                send_event(
+                                    &mut cs.ws,
+                                    &cs.authed_pubkey,
+                                    cs.accept_rumors,
+                                    &req_id,
+                                    &e,
+                                )
+                                .await?;
                             }
                         } else {
                             enum St {
@@ -445,7 +460,14 @@ async fn handle_message(
                                     }
                                 };
                                 for e in es {
-                                    send_event(&mut cs.ws, &cs.authed_pubkey, &req_id, &e).await?;
+                                    send_event(
+                                        &mut cs.ws,
+                                        &cs.authed_pubkey,
+                                        cs.accept_rumors,
+                                        &req_id,
+                                        &e,
+                                    )
+                                    .await?;
                                 }
                                 if matches!(continuation, St::End) {
                                     continue 'filters_loop;
@@ -462,6 +484,10 @@ async fn handle_message(
                 ClientMessage::Close(id) => {
                     debug!("close {id}");
                     cs.req.remove(id.as_ref());
+                    None
+                }
+                ClientMessage::AcceptRumors(accept_rumors) => {
+                    cs.accept_rumors = accept_rumors;
                     None
                 }
             },
@@ -536,6 +562,13 @@ async fn handle_event(
             (false, "invalid: bad auth".into())
         } else {
             cs.authed_pubkey = Some(event.pubkey);
+            cs.publish_rumors = event.tags.iter().any(|t| {
+                if let Tag(t, None) = t {
+                    t == "publish_rumors"
+                } else {
+                    false
+                }
+            });
             (true, "".into())
         }
     } else {
