@@ -268,7 +268,7 @@ impl Db {
             0 | 3 | 10000..20000 => {
                 let author = ConditionCompact::Author(author);
                 let kind = ConditionCompact::Kind(event.kind);
-                let mut outdated = None;
+                let mut outdated = Vec::with_capacity(1);
                 {
                     let mut i = GetEvents {
                         until: Time(u64::MAX, u64::MAX),
@@ -294,11 +294,11 @@ impl Db {
                         if have_newer {
                             return Err(AddEventError::HaveNewer);
                         } else {
-                            outdated = Some(n);
+                            outdated.push(n);
                         }
                     }
                 }
-                if let Some(n) = outdated {
+                for n in outdated {
                     self.remove_event(n, HashStatus::Outdated);
                 }
             }
