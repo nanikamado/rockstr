@@ -7,7 +7,7 @@ mod priority_queue;
 mod relay;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::ws::{self, WebSocket};
+use axum::extract::ws::{self, CloseFrame, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::header::USER_AGENT;
 use axum::http::HeaderMap;
@@ -139,8 +139,7 @@ pub async fn root(
                     publish_rumors: false,
                 };
                 let a = ws_handler(state, &mut cs).await;
-                debug!("ws close: {a:?}");
-                let _ = cs.ws.close().await;
+                debug!("ws close: {a:?} ({:?})", cs.source_info);
             }),
         Err(e) => {
             use WebSocketUpgradeRejection::*;
@@ -243,6 +242,24 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
             },
         }
     };
+    let reason = match r {
+        CloseReason::WsClosed => "unexpected",
+        CloseReason::NoResponse => {
+            "Closing connection because your client did not respond to our pings"
+        }
+        CloseReason::MaliciousConnection => "Closing connection because your client is buggy",
+    };
+    let _ = cs
+        .ws
+        .send(ws::Message::Text(format!(r#"["NOTICE","{reason}"]"#)))
+        .await;
+    let _ = cs
+        .ws
+        .send(ws::Message::Close(Some(CloseFrame {
+            reason: reason.into(),
+            code: 1000,
+        })))
+        .await;
     Ok(r)
 }
 
@@ -493,7 +510,14 @@ async fn handle_message(
             },
             Err(e) => {
                 warn!("parse error: {e}, text = {s:?}");
-                return Ok(None);
+                cs.ws
+                    .send(Message::Text(format!(
+                        r#"["NOTICE",{}]"#,
+                        serde_json::to_string(&format!("could not parse the message: {}", s))
+                            .unwrap()
+                    )))
+                    .await?;
+                None
             }
         },
         Message::Binary(_) => None,
@@ -502,7 +526,7 @@ async fn handle_message(
             None
         }
         Message::Pong(_) => None,
-        Message::Close(_) => Some(CloseReason::WsClosed),
+        Message::Close(_) => None,
     };
     Ok(continue_)
 }
