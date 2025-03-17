@@ -36,6 +36,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -175,7 +176,8 @@ pub async fn root(
     }
 }
 
-const TIMEOUT_DURATION: Duration = Duration::from_secs(60 * 3);
+// cloudflare's timeout is 100s, so the timeout should be less than 100s
+const TIMEOUT_DURATION: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 enum CloseReason {
@@ -212,29 +214,33 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
         .send(ws::Message::Text(format!(r#"["AUTH","{}"]"#, cs.challenge)))
         .await?;
     let mut waiting_for_pong = false;
+    let timeout_init = || Instant::now() + TIMEOUT_DURATION;
+    let mut timeout = timeout_init();
     let r = loop {
         tokio::select! {
-            m = tokio::time::timeout(TIMEOUT_DURATION, cs.ws.recv()) => {
+            m = cs.ws.recv() => {
+                timeout = timeout_init();
                 match m {
-                    Ok(Some(Ok(m))) => {
+                    Some(Ok(m)) => {
                         waiting_for_pong = false;
                         if let Some(r) = handle_message(&state, cs, m).await? {
                             break r;
                         }
                     }
-                    Ok(Some(Err(e))) => {
+                    Some(Err(e)) => {
                         debug!("ws error: {e}");
                     }
-                    Err(e) => {
-                        debug!("timeout: {e}");
-                        if waiting_for_pong {
-                            break CloseReason::NoResponse;
-                        } else {
-                            let _ = cs.ws.send(ws::Message::Ping(Vec::new())).await;
-                            waiting_for_pong = true;
-                        }
-                    }
                     _ => break CloseReason::WsClosed,
+                }
+            }
+            _ = tokio::time::sleep_until(timeout) => {
+                debug!("timeout");
+                if waiting_for_pong {
+                    break CloseReason::NoResponse;
+                } else {
+                    timeout = timeout_init();
+                    let _ = cs.ws.send(ws::Message::Ping(Vec::new())).await;
+                    waiting_for_pong = true;
                 }
             }
             e = cs.broadcast_receiver.recv() => {
