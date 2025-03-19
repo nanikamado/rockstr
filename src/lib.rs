@@ -5,6 +5,7 @@ pub mod nostr;
 mod plugin;
 mod priority_queue;
 mod relay;
+mod utils;
 
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{self, CloseFrame, WebSocket};
@@ -17,6 +18,7 @@ use axum::Router;
 use bitcoin_hashes::{sha256, Hash};
 use display_as_json::AsJson;
 pub use error::Error;
+use futures_util::sink::SinkExt;
 use hex_conservative::DisplayHex;
 use itertools::Itertools;
 use lnostr::{kinds, EventId};
@@ -31,12 +33,15 @@ use serde_json::json;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::env;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tokio_util::sync::PollSender;
+use utils::{DisplayIfSome, LineLimit};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -194,10 +199,15 @@ pub struct SourceInfo {
     user_agent: String,
 }
 
+pub struct ReqState {
+    filters: SmallVec<[Filter; 2]>,
+    req_handler: tokio::task::JoinHandle<()>,
+}
+
 struct ConnectionState {
     ws: WebSocket,
     broadcast_receiver: tokio::sync::broadcast::Receiver<Arc<Event>>,
-    req: FxHashMap<String, SmallVec<[Filter; 2]>>,
+    req: FxHashMap<String, ReqState>,
     challenge: String,
     authed_pubkey: Option<PubKey>,
     credit: u32,
@@ -216,6 +226,7 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
     let mut waiting_for_pong = false;
     let timeout_init = || Instant::now() + TIMEOUT_DURATION;
     let mut timeout = timeout_init();
+    let (relay_message_sender, mut relay_message_receiver) = mpsc::channel(100);
     let r = loop {
         tokio::select! {
             m = cs.ws.recv() => {
@@ -223,7 +234,7 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
                 match m {
                     Some(Ok(m)) => {
                         waiting_for_pong = false;
-                        if let Some(r) = handle_message(&state, cs, m).await? {
+                        if let Some(r) = handle_message(&state, cs, &relay_message_sender, m).await? {
                             break r;
                         }
                     }
@@ -231,6 +242,11 @@ async fn ws_handler(state: Arc<AppState>, cs: &mut ConnectionState) -> Result<Cl
                         debug!("ws error: {e}");
                     }
                     _ => break CloseReason::WsClosed,
+                }
+            }
+            m = relay_message_receiver.recv() => {
+                if let Some(m) = m {
+                    let _ = cs.ws.send(m).await;
                 }
             }
             _ = tokio::time::sleep_until(timeout) => {
@@ -279,13 +295,13 @@ fn is_addressed_to(event: &Event, to: &PubKey) -> bool {
     })
 }
 
-async fn send_event(
-    ws: &mut WebSocket,
+async fn send_event<T: futures_util::Sink<axum::extract::ws::Message> + Unpin>(
+    ws: &mut T,
     authed_pubkey: &Option<PubKey>,
     accept_rumors: bool,
     req_id: &str,
     event: &Event,
-) -> Result<(), Error> {
+) -> Result<(), <T as futures_util::Sink<axum::extract::ws::Message>>::Error> {
     use axum::extract::ws::Message;
     // To protect recipient metadata, relays SHOULD guard access to `kind 1059` events based on user AUTH
     // https://github.com/nostr-protocol/nips/blob/3f11c00fb93f118f207130344032710e34de4710/59.md?plain=1#L93
@@ -309,8 +325,8 @@ async fn receive_broadcast(
 ) {
     match e {
         Ok(e) => {
-            for (req_id, filters) in &cs.req {
-                if filters.iter().any(|f| f.matches(&e)) {
+            for (req_id, rs) in &cs.req {
+                if rs.filters.iter().any(|f| f.matches(&e)) {
                     let _ = send_event(&mut cs.ws, &cs.authed_pubkey, cs.accept_rumors, req_id, &e)
                         .await;
                 }
@@ -349,6 +365,7 @@ fn now_unix() -> u64 {
 async fn handle_message(
     state: &Arc<AppState>,
     cs: &mut ConnectionState,
+    relay_message_sender: &mpsc::Sender<ws::Message>,
     m: ws::Message,
 ) -> Result<Option<CloseReason>, Error> {
     use axum::extract::ws::Message;
@@ -379,28 +396,6 @@ async fn handle_message(
                     id: req_id,
                     filters,
                 } => {
-                    struct LineLimit<'a>(&'a str);
-                    impl Display for LineLimit<'_> {
-                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                            if self.0.len() > 3000 {
-                                write!(f, "{} ... ({} bytes)", &self.0[..3000], self.0.len())
-                            } else {
-                                write!(f, "{}", self.0)
-                            }
-                        }
-                    }
-                    enum DisplayIfSome<S: Display> {
-                        Some(S),
-                        None,
-                    }
-                    impl<S: Display> Display for DisplayIfSome<S> {
-                        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                            match &self {
-                                DisplayIfSome::Some(a) => write!(f, "{a}"),
-                                DisplayIfSome::None => Ok(()),
-                            }
-                        }
-                    }
                     debug!(
                         "[{}] req with {}{}",
                         cs.req_count,
@@ -421,92 +416,40 @@ async fn handle_message(
                         }
                     );
                     cs.req_count += 1;
-                    'filters_loop: for f in &filters {
-                        let f = FilterCompact::new(f, &state.db);
-                        let mut limit = f.limit;
-                        if let Some(ids) = f.ids {
-                            let es = {
-                                ids.into_iter()
-                                    .filter_map(|id| state.db.n_to_event_get(id))
-                                    .sorted_by_key(|e| (e.created_at, e.id))
-                                    .take(limit as usize)
-                            };
-                            for e in es {
-                                send_event(
-                                    &mut cs.ws,
-                                    &cs.authed_pubkey,
-                                    cs.accept_rumors,
-                                    &req_id,
-                                    &e,
-                                )
-                                .await?;
-                            }
-                        } else {
-                            enum St {
-                                Init,
-                                Middle(GetEventsStopped),
-                                End,
-                            }
-                            let mut continuation = St::Init;
-                            loop {
-                                let mut es = Vec::with_capacity(100);
-                                continuation = {
-                                    let db = &state.db;
-                                    let mut s = match continuation {
-                                        St::Init => {
-                                            let Some(s) = GetEvents::new(&f, db) else {
-                                                continue 'filters_loop;
-                                            };
-                                            s
-                                        }
-                                        St::Middle(s) => s.restart(db),
-                                        St::End => panic!(),
-                                    };
-                                    loop {
-                                        if limit == 0 {
-                                            break St::End;
-                                        }
-                                        let Some(Time(t, n)) = s.next(db) else {
-                                            break St::End;
-                                        };
-                                        if t < f.since {
-                                            break St::End;
-                                        }
-                                        let Some(e) = db.n_to_event_get(n) else {
-                                            continue;
-                                        };
-                                        limit -= 1;
-                                        es.push(e);
-                                        if es.len() >= 100 {
-                                            break St::Middle(s.stop());
-                                        }
-                                    }
-                                };
-                                for e in es {
-                                    send_event(
-                                        &mut cs.ws,
-                                        &cs.authed_pubkey,
-                                        cs.accept_rumors,
-                                        &req_id,
-                                        &e,
-                                    )
-                                    .await?;
-                                }
-                                if matches!(continuation, St::End) {
-                                    continue 'filters_loop;
-                                }
-                            }
-                        }
+                    let relay_message_sender = PollSender::new(relay_message_sender.clone());
+                    let state = state.clone();
+                    let authed_pubkey = cs.authed_pubkey;
+                    let accept_rumors = cs.accept_rumors;
+                    let req_id_clone = req_id.clone();
+                    let filters_clone = filters.clone();
+                    let req_handler = tokio::spawn(async move {
+                        let _ = handle_req(
+                            &state,
+                            &filters_clone,
+                            relay_message_sender,
+                            &authed_pubkey,
+                            accept_rumors,
+                            req_id_clone,
+                        )
+                        .await;
+                    });
+                    let prev = cs.req.insert(
+                        req_id,
+                        ReqState {
+                            filters,
+                            req_handler,
+                        },
+                    );
+                    if let Some(prev) = prev {
+                        prev.req_handler.abort();
                     }
-                    cs.ws
-                        .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&req_id))))
-                        .await?;
-                    cs.req.insert(req_id, filters);
                     None
                 }
                 ClientMessage::Close(id) => {
                     debug!("close {id}");
-                    cs.req.remove(id.as_ref());
+                    if let Some(task) = cs.req.remove(id.as_ref()) {
+                        task.req_handler.abort();
+                    }
                     None
                 }
                 ClientMessage::AcceptRumors(accept_rumors) => {
@@ -677,6 +620,98 @@ async fn handle_event(
     if let Some(e) = expiration {
         state.event_expiration_sender.send(e).await.unwrap();
     }
+    Ok(())
+}
+
+async fn handle_req(
+    state: &Arc<AppState>,
+    filters: &SmallVec<[Filter; 2]>,
+    mut relay_message_sender: PollSender<axum::extract::ws::Message>,
+    authed_pubkey: &Option<PubKey>,
+    accept_rumors: bool,
+    req_id: String,
+) -> Result<(), Error> {
+    use axum::extract::ws::Message;
+    'filters_loop: for f in filters {
+        let f = FilterCompact::new(f, &state.db);
+        let mut limit = f.limit;
+        if let Some(ids) = f.ids {
+            let es = {
+                ids.into_iter()
+                    .filter_map(|id| state.db.n_to_event_get(id))
+                    .sorted_by_key(|e| (e.created_at, e.id))
+                    .take(limit as usize)
+            };
+            for e in es {
+                send_event(
+                    &mut relay_message_sender,
+                    &authed_pubkey,
+                    accept_rumors,
+                    &req_id,
+                    &e,
+                )
+                .await?;
+            }
+        } else {
+            enum St {
+                Init,
+                Middle(GetEventsStopped),
+                End,
+            }
+            let mut continuation = St::Init;
+            loop {
+                let mut es = Vec::with_capacity(100);
+                continuation = {
+                    let db = &state.db;
+                    let mut s = match continuation {
+                        St::Init => {
+                            let Some(s) = GetEvents::new(&f, db) else {
+                                continue 'filters_loop;
+                            };
+                            s
+                        }
+                        St::Middle(s) => s.restart(db),
+                        St::End => panic!(),
+                    };
+                    loop {
+                        if limit == 0 {
+                            break St::End;
+                        }
+                        let Some(Time(t, n)) = s.next(db) else {
+                            break St::End;
+                        };
+                        if t < f.since {
+                            break St::End;
+                        }
+                        let Some(e) = db.n_to_event_get(n) else {
+                            continue;
+                        };
+                        limit -= 1;
+                        es.push(e);
+                        if es.len() >= 100 {
+                            break St::Middle(s.stop());
+                        }
+                    }
+                };
+                for e in es {
+                    send_event(
+                        &mut relay_message_sender,
+                        authed_pubkey,
+                        accept_rumors,
+                        &req_id,
+                        &e,
+                    )
+                    .await?;
+                }
+                if matches!(continuation, St::End) {
+                    continue 'filters_loop;
+                }
+            }
+        }
+    }
+    relay_message_sender
+        .send(Message::Text(format!(r#"["EOSE",{}]"#, AsJson(&req_id))))
+        .await?;
     Ok(())
 }
 

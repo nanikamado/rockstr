@@ -23,3 +23,5 @@ lnostr = { path = "crates/lnostr" }
 hex-conservative = "0.2.1"
 cached = { version="0.53.1", default-features = false }
 bitcoin_hashes = { version = "0.14.0", features = ["serde"] }
+futures-util = { version = "0.3.31", features = ["sink"] }
+tokio-util = "0.7.14"
