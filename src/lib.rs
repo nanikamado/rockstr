@@ -156,7 +156,7 @@ pub async fn root(
                 .and_then(|a| a.to_str().ok())
                 .is_some_and(|a| a.contains("application/nostr+json"))
             {
-                let mut r = json!({
+                let mut info = json!({
                     "description": state.config.relay_description,
                     "name": state.config.relay_name,
                     "software": "git+https://github.com/nanikamado/rockstr.git",
@@ -166,9 +166,11 @@ pub async fn root(
                         "max_message_length": state.config.max_message_length,
                         "created_at_upper_limit": state.config.created_at_upper_limit,
                     },
-                })
-                .to_string()
-                .into_response();
+                });
+                if state.config.block_note_without_profile || !state.config.plugin.is_empty() {
+                    info["limitation"]["restricted_writes"] = serde_json::Value::Bool(true);
+                }
+                let mut r = info.to_string().into_response();
                 r.headers_mut().insert(
                     axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
                     axum::http::header::HeaderValue::from_static("*"),
